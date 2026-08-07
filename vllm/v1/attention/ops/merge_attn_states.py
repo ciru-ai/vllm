@@ -29,9 +29,14 @@ def _merge_attn_states_torch(
         if prefill_tokens_with_context is None
         else prefill_tokens_with_context
     )
+    tokens_first_lse = prefix_lse.shape[:2] == output.shape[:2]
     if num_context_tokens:
-        p_lse = prefix_lse[:, :num_context_tokens].clone()
-        s_lse = suffix_lse[:, :num_context_tokens].clone()
+        if tokens_first_lse:
+            p_lse = prefix_lse[:num_context_tokens, :].clone()
+            s_lse = suffix_lse[:num_context_tokens, :].clone()
+        else:
+            p_lse = prefix_lse[:, :num_context_tokens].clone()
+            s_lse = suffix_lse[:, :num_context_tokens].clone()
         p_lse[p_lse == torch.inf] = -torch.inf
         s_lse[s_lse == torch.inf] = -torch.inf
         max_lse = torch.maximum(p_lse, s_lse)
@@ -40,22 +45,41 @@ def _merge_attn_states_torch(
         denom = p_exp + s_exp
         p_scale = torch.where(denom > 0, p_exp / denom, 0.0)
         s_scale = torch.where(denom > 0, s_exp / denom, 0.0)
+        p_scale_output_layout = (
+            p_scale.unsqueeze(-1)
+            if tokens_first_lse
+            else p_scale.transpose(0, 1).unsqueeze(-1)
+        )
+        s_scale_output_layout = (
+            s_scale.unsqueeze(-1)
+            if tokens_first_lse
+            else s_scale.transpose(0, 1).unsqueeze(-1)
+        )
         merged = (
             prefix_output[:num_context_tokens]
-            * p_scale.transpose(0, 1).unsqueeze(-1)
+            * p_scale_output_layout
             + suffix_output[:num_context_tokens]
-            * s_scale.transpose(0, 1).unsqueeze(-1)
+            * s_scale_output_layout
         )
         output[:num_context_tokens].copy_(merged.to(output.dtype))
         if output_lse is not None:
-            output_lse[:, :num_context_tokens].copy_(torch.logaddexp(p_lse, s_lse))
+            merged_lse = torch.logaddexp(p_lse, s_lse)
+            if tokens_first_lse:
+                output_lse[:num_context_tokens, :].copy_(merged_lse)
+            else:
+                output_lse[:, :num_context_tokens].copy_(merged_lse)
 
     if num_context_tokens < output.shape[0]:
         output[num_context_tokens:].copy_(suffix_output[num_context_tokens:])
         if output_lse is not None:
-            output_lse[:, num_context_tokens:].copy_(
-                suffix_lse[:, num_context_tokens:]
-            )
+            if tokens_first_lse:
+                output_lse[num_context_tokens:, :].copy_(
+                    suffix_lse[num_context_tokens:, :]
+                )
+            else:
+                output_lse[:, num_context_tokens:].copy_(
+                    suffix_lse[:, num_context_tokens:]
+                )
 
 
 def merge_attn_states(
