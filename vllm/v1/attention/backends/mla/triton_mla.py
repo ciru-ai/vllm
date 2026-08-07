@@ -13,6 +13,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonImpl,
     MLACommonMetadata,
     MLACommonMetadataBuilder,
+    QueryLenSupport,
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
@@ -51,6 +52,9 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = (
         AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     )
+    # Uniform multi-token groups (for example MTP verification) can use the
+    # decode kernel when each query row is mapped to its causal KV prefix.
+    query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
     # Non-causal DSpark block is flattened to one decode row per query token in
     # forward_mqa, so no intra-block causal masking is required.
     supports_non_causal_multi_token_decode: ClassVar[bool] = True
@@ -74,12 +78,10 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
         """
         if not is_workspace_manager_initialized():
             return
-        # Decode reorder threshold is 1, so decode tokens <= max_num_seqs.
+        # Uniform multi-token decode flattens each request's block to query_len
+        # rows. Reserve the largest admitted block before the workspace locks.
         B = self.vllm_config.scheduler_config.max_num_seqs
-        # Non-causal DSpark draft flattens each request's block to query_len
-        # decode rows; cover max_num_seqs * block_len rows.
-        if getattr(self, "non_causal_multi_token_decode", False):
-            B *= self.reorder_batch_threshold
+        B *= self.reorder_batch_threshold or 1
         # DCP all-gathers the query heads before forward_mqa.
         q_num_heads = self.num_heads * self.dcp_world_size
         max_splits = _compute_num_kv_splits(
@@ -285,14 +287,34 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         block_table = attn_metadata.decode.block_table
         seq_lens = attn_metadata.decode.seq_lens
-        if not attn_metadata.causal:
-            # Non-causal DSpark block: flatten to one decode row per query token.
-            # Each row attends to the same committed KV prefix (per-row seq_lens)
-            # and never to sibling block tokens = non-causal block semantics.
-            # Mirrors FlashInferMLA's non-causal path.
-            query_len = attn_metadata.num_decode_tokens // attn_metadata.num_decodes
-            if query_len > 1:
-                block_table = block_table.repeat_interleave(query_len, dim=0)
+        num_decodes = attn_metadata.num_decodes
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        assert num_decodes > 0
+        assert num_decode_tokens == B
+        assert num_decode_tokens % num_decodes == 0
+
+        query_len = num_decode_tokens // num_decodes
+        if query_len > 1:
+            block_table = block_table.repeat_interleave(query_len, dim=0)
+            if attn_metadata.causal:
+                logger.info_once(
+                    "Triton MLA A1 causal spec-as-decode route active: "
+                    "query_len=%d",
+                    query_len,
+                )
+                # seq_lens includes the whole verify block. Row t may attend
+                # only through its own position: context + t + 1.
+                token_offsets = torch.arange(
+                    query_len,
+                    device=seq_lens.device,
+                    dtype=seq_lens.dtype,
+                )
+                seq_lens = (
+                    seq_lens.unsqueeze(1) - (query_len - 1) + token_offsets
+                ).clamp_min(0).flatten()
+            else:
+                # Non-causal DSpark rows share the committed KV prefix and do
+                # not attend to sibling block tokens.
                 seq_lens = seq_lens.repeat_interleave(query_len)
 
         # Run MQA — always pass layer scales. When KV cache is
