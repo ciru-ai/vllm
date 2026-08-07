@@ -97,6 +97,7 @@ def fused_moe_kernel_gptq_awq(
     stride_bzn,
     block_k_diviable: tl.constexpr,
     group_size: tl.constexpr,
+    naive_block_assignment: tl.constexpr,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -155,12 +156,20 @@ def fused_moe_kernel_gptq_awq(
     # and accumulate
     # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
-        return
-    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    if not naive_block_assignment:
+        num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+        if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+            return
+        offs_token_id = pid_m * BLOCK_SIZE_M + offs
+        offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    else:
+        # Decode-only fast path: one routed token per program.  The remaining
+        # lanes are masked so no alignment, sorting, or padded-count load is
+        # needed.
+        offs_token = tl.where(offs == 0, pid_m, num_valid_tokens)
     # Cast to int64 to prevent overflow in stride*offset products
-    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+    offs_token = offs_token.to(tl.int64)
     token_mask = offs_token < num_valid_tokens
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
@@ -677,7 +686,7 @@ def invoke_fused_moe_wna16_triton_kernel(
     B_scale: torch.Tensor | None,
     B_zp: torch.Tensor | None,
     topk_weights: torch.Tensor | None,
-    sorted_token_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor | None,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
     mul_routed_weight: bool,
@@ -695,8 +704,11 @@ def invoke_fused_moe_wna16_triton_kernel(
     M = A.size(0)
     num_tokens = M * top_k
 
-    EM = sorted_token_ids.size(0)
-    if A.size(0) < config["BLOCK_SIZE_M"]:
+    if sorted_token_ids is None:
+        EM = num_tokens * config["BLOCK_SIZE_M"]
+    else:
+        EM = sorted_token_ids.size(0)
+    if sorted_token_ids is not None and A.size(0) < config["BLOCK_SIZE_M"]:
         # optimize for small batch_size.
         # We assume that top_ids of each token is unique,
         # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
@@ -756,6 +768,7 @@ def invoke_fused_moe_wna16_triton_kernel(
         has_zp=B_zp is not None,
         use_int4_w4a16=use_int4_w4a16,
         use_int8_w8a16=use_int8_w8a16,
+        naive_block_assignment=(sorted_token_ids is None),
         **config,
     )
 

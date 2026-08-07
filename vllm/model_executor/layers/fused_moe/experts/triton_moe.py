@@ -59,6 +59,30 @@ from vllm.triton_utils import tl
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 
+def _use_wna16_naive_block_assignment(
+    *,
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    global_num_experts: int,
+    block_size_m: int,
+    expert_map: torch.Tensor | None,
+    use_int4_w4a16: bool,
+    block_shape: list[int] | None,
+) -> bool:
+    """Select the narrowly validated gfx1151 WNA16 decode fast path."""
+    return (
+        num_tokens == 1
+        and top_k == 8
+        and num_experts == 512
+        and global_num_experts == 512
+        and block_size_m == 16
+        and expert_map is None
+        and use_int4_w4a16
+        and block_shape == [0, 32]
+    )
+
+
 class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
     """Triton-based fused MoE expert implementation."""
 
@@ -681,9 +705,30 @@ class TritonWNA16Experts(TritonExperts):
         )
         intermediate_cache3 = _resize_cache(workspace2, (num_tokens, top_k_num, K))
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, config["BLOCK_SIZE_M"], global_num_experts, expert_map
+        use_naive_block_assignment = _use_wna16_naive_block_assignment(
+            num_tokens=num_tokens,
+            top_k=top_k_num,
+            num_experts=E,
+            global_num_experts=global_num_experts,
+            block_size_m=config["BLOCK_SIZE_M"],
+            expert_map=expert_map,
+            use_int4_w4a16=self.quant_config.use_int4_w4a16,
+            block_shape=self.block_shape,
         )
+        if use_naive_block_assignment:
+            sorted_token_ids = None
+            expert_ids = topk_ids.view(-1)
+            # Compile-time dead in the naive kernel specialization.
+            num_tokens_post_padded = expert_ids
+        else:
+            sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                moe_align_block_size(
+                    topk_ids,
+                    config["BLOCK_SIZE_M"],
+                    global_num_experts,
+                    expert_map,
+                )
+            )
 
         invoke_fused_moe_wna16_triton_kernel(
             hidden_states,
