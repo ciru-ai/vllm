@@ -77,6 +77,7 @@ from vllm.third_party.flash_linear_attention.ops.kda import (
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.utils import record_function_or_nullcontext
 
 from .interfaces import HasInnerState, IsHybrid, SupportsPP
 from .utils import PPMissingLayer, is_pp_missing_parameter, make_layers, maybe_prefix
@@ -999,7 +1000,11 @@ class BailingMoeV3DecoderLayer(nn.Module):
                 cache_config=cache_config,
             )
 
-        if config.num_experts is not None and layer_id >= config.first_k_dense_replace:
+        self.is_moe_layer = (
+            config.num_experts is not None
+            and layer_id >= config.first_k_dense_replace
+        )
+        if self.is_moe_layer:
             self.mlp = BailingMoeV3MoE(
                 config,
                 quant_config=quant_config,
@@ -1032,14 +1037,22 @@ class BailingMoeV3DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        if self.is_kda_layer:
-            attn_output = torch.zeros_like(hidden_states)
-            self.self_attn(hidden_states, positions, attn_output)
-        else:
-            attn_output = self.self_attn(hidden_states, positions)
+        attn_family = "kda" if self.is_kda_layer else "mla"
+        with record_function_or_nullcontext(
+            f"ling3:{attn_family}:layer={self.layer_id}"
+        ):
+            if self.is_kda_layer:
+                attn_output = torch.zeros_like(hidden_states)
+                self.self_attn(hidden_states, positions, attn_output)
+            else:
+                attn_output = self.self_attn(hidden_states, positions)
 
         hidden_states, residual = self.post_attention_layernorm(attn_output, residual)
-        hidden_states = self.mlp(hidden_states)
+        mlp_family = "moe" if self.is_moe_layer else "dense_mlp"
+        with record_function_or_nullcontext(
+            f"ling3:{mlp_family}:layer={self.layer_id}"
+        ):
+            hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
