@@ -1,9 +1,61 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 
 from vllm.platforms import current_platform
+
+
+def _merge_attn_states_torch(
+    output: torch.Tensor,
+    prefix_output: torch.Tensor,
+    prefix_lse: torch.Tensor,
+    suffix_output: torch.Tensor,
+    suffix_lse: torch.Tensor,
+    output_lse: torch.Tensor | None,
+    prefill_tokens_with_context: int | None,
+) -> None:
+    """Safe ROCm fallback for the Triton merge kernel.
+
+    This follows the reference implementation in
+    tests/kernels/attention/test_merge_attn_states.py. It is intentionally
+    opt-in because it trades a small amount of prefill performance for avoiding
+    gfx1151 HSA memory faults in merge_attn_states_kernel.
+    """
+    num_context_tokens = (
+        output.shape[0]
+        if prefill_tokens_with_context is None
+        else prefill_tokens_with_context
+    )
+    if num_context_tokens:
+        p_lse = prefix_lse[:, :num_context_tokens].clone()
+        s_lse = suffix_lse[:, :num_context_tokens].clone()
+        p_lse[p_lse == torch.inf] = -torch.inf
+        s_lse[s_lse == torch.inf] = -torch.inf
+        max_lse = torch.maximum(p_lse, s_lse)
+        p_exp = torch.nan_to_num(torch.exp(p_lse - max_lse), nan=0.0)
+        s_exp = torch.nan_to_num(torch.exp(s_lse - max_lse), nan=0.0)
+        denom = p_exp + s_exp
+        p_scale = torch.where(denom > 0, p_exp / denom, 0.0)
+        s_scale = torch.where(denom > 0, s_exp / denom, 0.0)
+        merged = (
+            prefix_output[:num_context_tokens]
+            * p_scale.transpose(0, 1).unsqueeze(-1)
+            + suffix_output[:num_context_tokens]
+            * s_scale.transpose(0, 1).unsqueeze(-1)
+        )
+        output[:num_context_tokens].copy_(merged.to(output.dtype))
+        if output_lse is not None:
+            output_lse[:, :num_context_tokens].copy_(torch.logaddexp(p_lse, s_lse))
+
+    if num_context_tokens < output.shape[0]:
+        output[num_context_tokens:].copy_(suffix_output[num_context_tokens:])
+        if output_lse is not None:
+            output_lse[:, num_context_tokens:].copy_(
+                suffix_lse[:, num_context_tokens:]
+            )
 
 
 def merge_attn_states(
@@ -45,6 +97,21 @@ def merge_attn_states(
         output_scale: Optional scalar tensor for FP8 static quantization.
             When provided, output must be FP8 dtype.
     """
+
+    if (
+        current_platform.is_rocm()
+        and os.getenv("VLLM_ROCM_SAFE_MERGE_ATTN_STATES", "0") == "1"
+        and output_scale is None
+    ):
+        return _merge_attn_states_torch(
+            output,
+            prefix_output,
+            prefix_lse,
+            suffix_output,
+            suffix_lse,
+            output_lse,
+            prefill_tokens_with_context,
+        )
 
     # Both the CUDA and Triton kernels derive the suffix head stride from
     # prefix_output, so suffix_output must share the same head stride.
