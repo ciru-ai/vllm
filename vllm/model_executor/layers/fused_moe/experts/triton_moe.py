@@ -27,6 +27,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
+from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import moe_sum_decode
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
@@ -782,5 +783,18 @@ class TritonWNA16Experts(TritonExperts):
             block_shape=self.block_shape,
         )
 
-        # separate function is required for MoE + LoRA
-        self.moe_sum(intermediate_cache3, output)
+        # The native HIP top-k sum has very high fixed latency on gfx1151 for
+        # this exact single-token route. Keep every adjacent shape on the
+        # native implementation.
+        if (
+            use_naive_block_assignment
+            and self._lora_context is None
+            and intermediate_cache3.shape == (1, 8, 2560)
+            and output.shape == (1, 2560)
+            and intermediate_cache3.is_contiguous()
+            and output.is_contiguous()
+        ):
+            moe_sum_decode(intermediate_cache3, output)
+        else:
+            # separate function is required for MoE + LoRA
+            self.moe_sum(intermediate_cache3, output)
