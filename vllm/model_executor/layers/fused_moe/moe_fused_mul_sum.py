@@ -35,8 +35,8 @@ def moe_sum_decode(
     output: torch.Tensor,
 ) -> torch.Tensor:
     """Low-launch-overhead sum for exact Ling WNA16 decode/verify shapes."""
-    assert inputs.shape in ((1, 8, 2560), (3, 8, 2560))
-    assert output.shape in ((1, 2560), (3, 2560))
+    assert inputs.shape in ((1, 8, 2560), (2, 8, 2560), (3, 8, 2560))
+    assert output.shape in ((1, 2560), (2, 2560), (3, 2560))
     assert output.shape[0] == inputs.shape[0]
     assert inputs.dtype == torch.bfloat16
     assert output.dtype == torch.bfloat16
