@@ -71,9 +71,9 @@ def _use_wna16_naive_block_assignment(
     use_int4_w4a16: bool,
     block_shape: list[int] | None,
 ) -> bool:
-    """Select the narrowly validated gfx1151 WNA16 decode fast path."""
+    """Select the narrowly validated gfx1151 WNA16 small-token fast path."""
     return (
-        num_tokens == 1
+        num_tokens in (1, 3)
         and top_k == 8
         and num_experts == 512
         and global_num_experts == 512
@@ -716,6 +716,11 @@ class TritonWNA16Experts(TritonExperts):
             use_int4_w4a16=self.quant_config.use_int4_w4a16,
             block_shape=self.block_shape,
         )
+        use_naive_block_assignment = (
+            use_naive_block_assignment
+            and topk_ids.shape == (num_tokens, top_k_num)
+            and topk_ids.is_contiguous()
+        )
         if use_naive_block_assignment:
             sorted_token_ids = None
             expert_ids = topk_ids.view(-1)
@@ -784,13 +789,14 @@ class TritonWNA16Experts(TritonExperts):
         )
 
         # The native HIP top-k sum has very high fixed latency on gfx1151 for
-        # this exact single-token route. Keep every adjacent shape on the
-        # native implementation.
+        # the exact target-decode and K2 verification shapes. Keep every
+        # adjacent shape on the native implementation.
         if (
             use_naive_block_assignment
             and self._lora_context is None
-            and intermediate_cache3.shape == (1, 8, 2560)
-            and output.shape == (1, 2560)
+            and intermediate_cache3.shape in ((1, 8, 2560), (3, 8, 2560))
+            and output.shape in ((1, 2560), (3, 2560))
+            and output.shape[0] == intermediate_cache3.shape[0]
             and intermediate_cache3.is_contiguous()
             and output.is_contiguous()
         ):

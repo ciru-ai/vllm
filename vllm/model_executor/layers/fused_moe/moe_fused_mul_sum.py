@@ -15,30 +15,36 @@ def moe_sum_decode_kernel(
     top_k: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """Sum a single token's routed outputs in fixed route order."""
+    """Sum a small token batch's routed outputs in fixed route order."""
+    token = tl.program_id(1)
     offsets = tl.program_id(0) * BLOCK_K + tl.arange(0, BLOCK_K)
     mask = offsets < size
     accumulator = tl.zeros((BLOCK_K,), dtype=tl.float32)
     for route in tl.static_range(top_k):
-        value = tl.load(input_ptr + route * size + offsets, mask=mask, other=0.0)
+        value = tl.load(
+            input_ptr + (token * top_k + route) * size + offsets,
+            mask=mask,
+            other=0.0,
+        )
         accumulator += value.to(tl.float32)
-    tl.store(output_ptr + offsets, accumulator, mask=mask)
+    tl.store(output_ptr + token * size + offsets, accumulator, mask=mask)
 
 
 def moe_sum_decode(
     inputs: torch.Tensor,
     output: torch.Tensor,
 ) -> torch.Tensor:
-    """Low-launch-overhead sum for the exact Ling WNA16 decode shape."""
-    assert inputs.shape == (1, 8, 2560)
-    assert output.shape == (1, 2560)
+    """Low-launch-overhead sum for exact Ling WNA16 decode/verify shapes."""
+    assert inputs.shape in ((1, 8, 2560), (3, 8, 2560))
+    assert output.shape in ((1, 2560), (3, 2560))
+    assert output.shape[0] == inputs.shape[0]
     assert inputs.dtype == torch.bfloat16
     assert output.dtype == torch.bfloat16
     assert inputs.is_contiguous()
     assert output.is_contiguous()
 
     if not isinstance(inputs, FakeTensor):
-        moe_sum_decode_kernel[(5,)](
+        moe_sum_decode_kernel[(5, inputs.shape[0])](
             inputs,
             output,
             size=2560,
