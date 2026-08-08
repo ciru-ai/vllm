@@ -56,7 +56,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt8StaticTensorSym,
 )
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl
+from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 
@@ -81,6 +81,72 @@ def _use_wna16_naive_block_assignment(
         and expert_map is None
         and use_int4_w4a16
         and block_shape == [0, 32]
+    )
+
+
+_WNA16_SILU_OUTPUT_SIZE = 768
+_WNA16_SILU_BLOCK_SIZE = 128
+
+
+@triton.jit
+def _wna16_exact_silu_and_mul_kernel(
+    input_ptr,
+    output_ptr,
+    OUTPUT_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    offsets = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < OUTPUT_SIZE
+    row_input = input_ptr + row * (2 * OUTPUT_SIZE)
+    gate = tl.load(row_input + offsets, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(row_input + OUTPUT_SIZE + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+
+    # Match the native packed HIP kernel's intermediate BF16 rounding.
+    activated = (gate * tl.sigmoid(gate)).to(tl.bfloat16).to(tl.float32)
+    tl.store(
+        output_ptr + row * OUTPUT_SIZE + offsets,
+        activated * up,
+        mask=mask,
+    )
+
+
+def _use_wna16_exact_silu_and_mul(
+    output: torch.Tensor, input: torch.Tensor
+) -> bool:
+    if torch.compiler.is_compiling() or not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx1151
+
+    return (
+        on_gfx1151()
+        and input.is_cuda
+        and output.is_cuda
+        and input.dtype == torch.bfloat16
+        and output.dtype == torch.bfloat16
+        and input.is_contiguous()
+        and output.is_contiguous()
+        and input.shape in ((8, 1536), (16, 1536))
+        and output.shape == (input.shape[0], _WNA16_SILU_OUTPUT_SIZE)
+    )
+
+
+def _invoke_wna16_exact_silu_and_mul(
+    output: torch.Tensor, input: torch.Tensor
+) -> None:
+    grid = (
+        input.shape[0],
+        triton.cdiv(_WNA16_SILU_OUTPUT_SIZE, _WNA16_SILU_BLOCK_SIZE),
+    )
+    _wna16_exact_silu_and_mul_kernel[grid](
+        input,
+        output,
+        OUTPUT_SIZE=_WNA16_SILU_OUTPUT_SIZE,
+        BLOCK_SIZE=_WNA16_SILU_BLOCK_SIZE,
+        num_warps=1,
     )
 
 
@@ -626,6 +692,33 @@ class TritonWNA16Experts(TritonExperts):
         return not (
             moe_parallel_config.use_fi_nvl_two_sided_kernels
             or moe_parallel_config.use_fi_nvl_one_sided_kernels
+        )
+
+    def activation(
+        self,
+        activation: MoEActivation,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        **kwargs,
+    ) -> None:
+        # Keep compiled MLA-side MoE activations on Inductor's fused pointwise
+        # route. The exact KDA-side eager shapes otherwise pay the high fixed
+        # latency of the generic HIP activation kernel on gfx1151.
+        if (
+            activation == MoEActivation.SILU
+            and self.activation_config.clamp_limit is None
+            and self.quant_config.use_int4_w4a16
+            and self.block_shape == [0, 32]
+            and _use_wna16_exact_silu_and_mul(output, input)
+        ):
+            _invoke_wna16_exact_silu_and_mul(output, input)
+            return
+
+        super().activation(
+            activation,
+            output,
+            input,
+            **kwargs,
         )
 
     def apply(
