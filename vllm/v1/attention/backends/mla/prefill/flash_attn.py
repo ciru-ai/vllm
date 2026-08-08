@@ -416,6 +416,14 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
         if isinstance(attn_out, tuple):
             attn_out, lse = attn_out[0], attn_out[1]
 
+        # The upstream FlashAttention Triton backend on ROCm returns varlen
+        # LSE as [total_q, num_heads], despite documenting (and fake-tensor
+        # modeling) [num_heads, total_q]. vLLM's MLA merge contract uses the
+        # latter layout. Normalize at the adapter boundary so multi-request
+        # cached-prefix prefills do not fail while accumulating context chunks.
+        if not self._is_vllm_fa and lse is not None:
+            lse = lse.transpose(0, 1).contiguous()
+
         # Remain consistent with old `flash_attn_varlen_func` where there
         # is only one output tensor if `return_softmax_lse` is False.
         if return_softmax_lse:

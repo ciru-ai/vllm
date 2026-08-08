@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for MLA prefill backend fused-quant-output support.
+"""Tests for MLA prefill adapter contracts and fused-quant-output support.
 
-Covers two things:
+Covers three things:
+  * ROCm upstream FlashAttention LSE layout normalization at the adapter boundary.
   * `MLAPrefillBackend.supports_quant_output`, the capability gate that decides
     whether the prefill kernel writes quantized output directly (FA4 native
     fused FP8, see flash-attention#135) instead of the post-quant path.
@@ -10,11 +11,16 @@ Covers two things:
     + standalone static-FP8-quant path it replaces (GPU-only, SM100/SM110).
 """
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
+from vllm.model_executor.layers.attention.mla_attention import (
+    accumulate_mla_context_chunk,
+    init_mla_context_partial,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Dynamic128Sym,
     kFp8StaticTensorSym,
@@ -57,7 +63,85 @@ def _make_fa_backend(version: int | None, is_vllm_fa: bool):
     backend = object.__new__(FlashAttnPrefillBackend)
     backend.vllm_flash_attn_version = version
     backend._is_vllm_fa = is_vllm_fa
+    backend.flash_attn_varlen_func = None
     return backend
+
+
+@pytest.mark.parametrize("is_vllm_fa", [False, True])
+def test_flash_attn_normalizes_rocm_varlen_lse_layout(is_vllm_fa):
+    """ROCm upstream FA returns [tokens, heads]; MLA requires [heads, tokens]."""
+    backend = _make_fa_backend(version=None, is_vllm_fa=is_vllm_fa)
+    backend.requires_v_padding = False
+    tokens, heads, dim = 5, 3, 4
+    attn_out = torch.zeros(tokens, heads, dim)
+    token_major_lse = torch.arange(tokens * heads).reshape(tokens, heads)
+
+    with patch(
+        f"{_FA_MODULE}.FA4_MLA_PREFILL_KERNEL",
+        return_value=(attn_out, token_major_lse),
+    ):
+        _, lse = backend._flash_attn_varlen_diff_headdims(
+            q=attn_out,
+            k=attn_out,
+            v=attn_out,
+            return_softmax_lse=True,
+        )
+
+    expected = token_major_lse if is_vllm_fa else token_major_lse.transpose(0, 1)
+    torch.testing.assert_close(lse, expected)
+    if not is_vllm_fa:
+        assert lse.is_contiguous()
+
+
+def test_rocm_lse_normalization_satisfies_context_accumulator_contract():
+    """Token-major ROCm LSE must reach MLA accumulation as head-major.
+
+    This reproduces the release failure at the adapter/accumulator boundary:
+    without normalization, the accumulator tries to copy a head-count-wide
+    dimension into a token-count-wide destination and terminates EngineCore.
+    """
+    backend = _make_fa_backend(version=None, is_vllm_fa=False)
+    backend.requires_v_padding = False
+    tokens, heads, dim = 5, 3, 4
+    attn_output = torch.arange(tokens * heads * dim).reshape(tokens, heads, dim)
+    token_major_lse = torch.arange(tokens * heads).reshape(tokens, heads)
+
+    with patch(
+        f"{_FA_MODULE}.FA4_MLA_PREFILL_KERNEL",
+        return_value=(attn_output, token_major_lse),
+    ):
+        normalized_output, normalized_lse = (
+            backend._flash_attn_varlen_diff_headdims(
+                q=attn_output,
+                k=attn_output,
+                v=attn_output,
+                return_softmax_lse=True,
+            )
+        )
+
+    metadata = SimpleNamespace(empty_token_slices=[])
+    output, output_lse = init_mla_context_partial(
+        metadata,
+        normalized_output,
+        normalized_lse,
+        num_tokens=tokens,
+    )
+    chunk = SimpleNamespace(
+        token_slice=slice(0, tokens),
+        continuation_token_end=tokens,
+        is_continuation=False,
+    )
+    accumulate_mla_context_chunk(
+        chunk,
+        normalized_output,
+        normalized_lse,
+        output,
+        output_lse,
+    )
+
+    assert output_lse.shape == (heads, tokens)
+    torch.testing.assert_close(output, attn_output)
+    torch.testing.assert_close(output_lse, token_major_lse.transpose(0, 1))
 
 
 @pytest.mark.parametrize(
