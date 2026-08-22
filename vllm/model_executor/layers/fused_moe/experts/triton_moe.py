@@ -427,25 +427,6 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         if global_num_experts == -1:
             global_num_experts = E
 
-        ling_iu4_layer_selected = True
-        if _LING_IU4_DECODE_ENABLED and _LING_IU4_LAYER_WINDOW is not None:
-            weight_key = w1.data_ptr()
-            layer_ordinal = _LING_IU4_WEIGHT_ORDINALS.get(weight_key)
-            if layer_ordinal is None:
-                layer_ordinal = len(_LING_IU4_WEIGHT_ORDINALS)
-                _LING_IU4_WEIGHT_ORDINALS[weight_key] = layer_ordinal
-            ling_iu4_layer_selected = (
-                _LING_IU4_LAYER_WINDOW[0]
-                <= layer_ordinal
-                < _LING_IU4_LAYER_WINDOW[1]
-            )
-            if (
-                ling_iu4_layer_selected
-                and layer_ordinal not in _LING_IU4_LOGGED_ORDINALS
-            ):
-                _LING_IU4_LOGGED_ORDINALS.add(layer_ordinal)
-                logger.warning("LING_IU4 selected routed-MoE ordinal %d", layer_ordinal)
-
         config = try_get_optimal_moe_config(
             w1.size(),
             w2.size(),
@@ -842,6 +823,25 @@ class TritonWNA16Experts(TritonExperts):
 
         if global_num_experts == -1:
             global_num_experts = E
+
+        ling_iu4_layer_selected = True
+        if _LING_IU4_DECODE_ENABLED and _LING_IU4_LAYER_WINDOW is not None:
+            weight_key = w1.data_ptr()
+            layer_ordinal = _LING_IU4_WEIGHT_ORDINALS.get(weight_key)
+            if layer_ordinal is None:
+                layer_ordinal = len(_LING_IU4_WEIGHT_ORDINALS)
+                _LING_IU4_WEIGHT_ORDINALS[weight_key] = layer_ordinal
+            ling_iu4_layer_selected = (
+                _LING_IU4_LAYER_WINDOW[0]
+                <= layer_ordinal
+                < _LING_IU4_LAYER_WINDOW[1]
+            )
+            if (
+                ling_iu4_layer_selected
+                and layer_ordinal not in _LING_IU4_LOGGED_ORDINALS
+            ):
+                _LING_IU4_LOGGED_ORDINALS.add(layer_ordinal)
+                logger.warning("LING_IU4 selected routed-MoE ordinal %d", layer_ordinal)
 
         ling_iu4_common_eligible = (
             _LING_IU4_DECODE_ENABLED
