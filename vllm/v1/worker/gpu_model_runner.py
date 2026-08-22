@@ -675,6 +675,9 @@ class GPUModelRunner(
         self.ling_kairic_ngram = None
         self.ling_kairic_ngram_hits = 0
         self.ling_kairic_ngram_misses = 0
+        self.ling_kairic_prev_was_ngram = False
+        self.ling_kairic_low_accept_streak = 0
+        self.ling_kairic_ngram_cooldown = 0
         if (
             os.getenv("VLLM_LING_KAIRIC_EDGE", "0") == "1"
             and self.speculative_config is not None
@@ -1617,6 +1620,27 @@ class GPUModelRunner(
         """
         if not self.speculative_config or not self.model_config.is_hybrid:
             return
+
+        # Kairic's modified ngram policy resets after three consecutive
+        # low-acceptance rounds. With request-local history there is no global
+        # map to clear, so temporarily suppress lookups while MTP advances the
+        # sequence beyond the self-match. This prevents low-value copy loops.
+        if self.ling_kairic_ngram is not None and self.ling_kairic_prev_was_ngram:
+            assert output_token_ids.size(0) == 1
+            num_valid = int((output_token_ids[0] != -1).sum().item())
+            accepted_drafts = max(0, num_valid - 1)
+            if accepted_drafts < 32:
+                self.ling_kairic_low_accept_streak += 1
+            else:
+                self.ling_kairic_low_accept_streak = 0
+            if self.ling_kairic_low_accept_streak >= 3:
+                self.ling_kairic_ngram_cooldown = 64
+                self.ling_kairic_low_accept_streak = 0
+                logger.info(
+                    "LING_KAIRIC_NGRAM reset: three low-acceptance rounds; "
+                    "MTP cooldown=64"
+                )
+            self.ling_kairic_prev_was_ngram = False
 
         # Count the number of accepted tokens for each sequence.
         # Valid tokens are contiguous from position 0, so counting non-(-1)
@@ -5310,18 +5334,23 @@ class GPUModelRunner(
                         "Ling Kairic Edge requires "
                         "disable_padded_drafter_batch=true"
                     )
-                ngram_draft = self.ling_kairic_ngram.propose(
-                    min(64, num_spec_tokens_to_schedule),
-                    sampled_token_ids,
-                    self.input_batch.num_tokens_no_spec,
-                    self.input_batch.token_ids_cpu,
-                    slot_mappings=slot_mappings,
-                )
+                if self.ling_kairic_ngram_cooldown > 0:
+                    self.ling_kairic_ngram_cooldown -= 1
+                    ngram_draft = [[]]
+                else:
+                    ngram_draft = self.ling_kairic_ngram.propose(
+                        min(64, num_spec_tokens_to_schedule),
+                        sampled_token_ids,
+                        self.input_batch.num_tokens_no_spec,
+                        self.input_batch.token_ids_cpu,
+                        slot_mappings=slot_mappings,
+                    )
                 # The modified policy is all-or-nothing: short continuations
                 # do not displace the MTP fallback.
                 if len(ngram_draft) == 1 and len(ngram_draft[0]) == 64:
                     draft_token_ids = ngram_draft
                     used_ling_kairic_ngram = True
+                    self.ling_kairic_prev_was_ngram = True
                     self.ling_kairic_ngram_hits += 1
                     logger.info(
                         "LING_KAIRIC_NGRAM hit=%d miss=%d draft=64",
