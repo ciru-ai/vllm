@@ -64,7 +64,8 @@ from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 
 logger = logging.getLogger(__name__)
-_LING_IU4_DECODE_ENABLED = os.environ.get("VLLM_LING_IU4_DECODE") == "1"
+_LING_IU4_DECODE_MODE = os.environ.get("VLLM_LING_IU4_DECODE", "")
+_LING_IU4_DECODE_ENABLED = _LING_IU4_DECODE_MODE in ("1", "full", "w2")
 if _LING_IU4_DECODE_ENABLED:
     _ling_iu4_library = os.environ.get("VLLM_LING_IU4_LIBRARY")
     if not _ling_iu4_library:
@@ -783,7 +784,7 @@ class TritonWNA16Experts(TritonExperts):
         if global_num_experts == -1:
             global_num_experts = E
 
-        if (
+        ling_iu4_decode_eligible = (
             _LING_IU4_DECODE_ENABLED
             and current_platform.is_rocm()
             and hidden_states.dtype == torch.bfloat16
@@ -821,7 +822,8 @@ class TritonWNA16Experts(TritonExperts):
             and topk_ids.is_contiguous()
             and topk_weights.dtype == torch.float32
             and topk_weights.is_contiguous()
-        ):
+        )
+        if ling_iu4_decode_eligible and _LING_IU4_DECODE_MODE in ("1", "full"):
             candidate = torch.ops.ling_iu4_decode.moe(
                 hidden_states,
                 w1.view(torch.int32),
@@ -917,6 +919,17 @@ class TritonWNA16Experts(TritonExperts):
         self.activation(
             activation, intermediate_cache2, intermediate_cache1.view(-1, N)
         )
+
+        if ling_iu4_decode_eligible and _LING_IU4_DECODE_MODE == "w2":
+            candidate = torch.ops.ling_iu4_decode.w2(
+                intermediate_cache2,
+                w2.view(torch.int32),
+                self.w2_scale,
+                topk_ids,
+                topk_weights,
+            )
+            output.copy_(candidate)
+            return
 
         a2q_scale: torch.Tensor | None = None
 
