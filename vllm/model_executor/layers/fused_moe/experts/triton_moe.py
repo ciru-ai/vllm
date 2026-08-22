@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton-based MoE expert implementations."""
 
+import logging
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -58,6 +61,18 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+
+
+logger = logging.getLogger(__name__)
+_LING_IU4_DECODE_ENABLED = os.environ.get("VLLM_LING_IU4_DECODE") == "1"
+if _LING_IU4_DECODE_ENABLED:
+    _ling_iu4_library = os.environ.get("VLLM_LING_IU4_LIBRARY")
+    if not _ling_iu4_library:
+        raise RuntimeError(
+            "VLLM_LING_IU4_LIBRARY is required when VLLM_LING_IU4_DECODE=1"
+        )
+    torch.ops.load_library(_ling_iu4_library)
+    logger.warning("Loaded experimental Ling gfx1151 decode IU4 operator: %s", _ling_iu4_library)
 
 
 def _use_wna16_naive_block_assignment(
@@ -767,6 +782,57 @@ class TritonWNA16Experts(TritonExperts):
 
         if global_num_experts == -1:
             global_num_experts = E
+
+        if (
+            _LING_IU4_DECODE_ENABLED
+            and current_platform.is_rocm()
+            and hidden_states.dtype == torch.bfloat16
+            and output.dtype == torch.bfloat16
+            and num_tokens in (1, 2, 3)
+            and E == 512
+            and global_num_experts == 512
+            and top_k_num == 8
+            and N == 1536
+            and K == 2560
+            and tuple(w1.shape) == (512, 1536, 1280)
+            and tuple(w2.shape) == (512, 2560, 384)
+            and w1.dtype == torch.uint8
+            and w2.dtype == torch.uint8
+            and self.w1_scale is not None
+            and self.w2_scale is not None
+            and tuple(self.w1_scale.shape) == (512, 1536, 80)
+            and tuple(self.w2_scale.shape) == (512, 2560, 24)
+            and self.w1_scale.dtype == torch.bfloat16
+            and self.w2_scale.dtype == torch.bfloat16
+            and self.quant_config.use_int4_w4a16
+            and self.quant_config.w1_zp is None
+            and self.quant_config.w2_zp is None
+            and self.block_shape == [0, 32]
+            and activation == MoEActivation.SILU
+            and self.activation_config.clamp_limit is None
+            and expert_map is None
+            and a1q_scale is None
+            and a2_scale is None
+            and expert_tokens_meta is None
+            and not apply_router_weight_on_input
+            and self._lora_context is None
+            and hidden_states.is_contiguous()
+            and topk_ids.dtype == torch.int32
+            and topk_ids.is_contiguous()
+            and topk_weights.dtype == torch.float32
+            and topk_weights.is_contiguous()
+        ):
+            candidate = torch.ops.ling_iu4_decode.moe(
+                hidden_states,
+                w1.view(torch.int32),
+                self.w1_scale,
+                w2.view(torch.int32),
+                self.w2_scale,
+                topk_ids,
+                topk_weights,
+            )
+            output.copy_(candidate)
+            return
 
         config = try_get_optimal_moe_config(
             w1.size(),
