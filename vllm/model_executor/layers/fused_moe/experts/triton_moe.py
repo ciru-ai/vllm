@@ -87,6 +87,9 @@ else:
     _LING_IU4_LAYER_WINDOW = None
 _LING_IU4_WEIGHT_ORDINALS: dict[int, int] = {}
 _LING_IU4_LOGGED_ORDINALS: set[int] = set()
+_LING_W2_CAPTURE_DIR = os.environ.get("LING_W2_CAPTURE_DIR", "")
+_LING_W2_CAPTURE_ORDINALS: dict[int, int] = {}
+_LING_W2_CAPTURED_ORDINALS: set[int] = set()
 _LING_IU4_DECODE_ENABLED = _LING_IU4_DECODE_MODE in (
     "1",
     "full",
@@ -1113,6 +1116,37 @@ class TritonWNA16Experts(TritonExperts):
         self.activation(
             activation, intermediate_cache2, intermediate_cache1.view(-1, N)
         )
+
+        if _LING_W2_CAPTURE_DIR and num_tokens == 1:
+            weight_key = w1.data_ptr()
+            capture_ordinal = _LING_W2_CAPTURE_ORDINALS.get(weight_key)
+            if capture_ordinal is None:
+                capture_ordinal = len(_LING_W2_CAPTURE_ORDINALS)
+                _LING_W2_CAPTURE_ORDINALS[weight_key] = capture_ordinal
+            if capture_ordinal not in _LING_W2_CAPTURED_ORDINALS:
+                _LING_W2_CAPTURED_ORDINALS.add(capture_ordinal)
+                os.makedirs(_LING_W2_CAPTURE_DIR, exist_ok=True)
+                selected_experts = topk_ids[0].to(torch.long)
+                torch.save(
+                    {
+                        "ordinal": capture_ordinal,
+                        "hidden": intermediate_cache2.detach().cpu(),
+                        "topk_ids": topk_ids.detach().cpu(),
+                        "topk_weights": topk_weights.detach().cpu(),
+                        "w2": w2.index_select(0, selected_experts).detach().cpu(),
+                        "w2_scale": self.w2_scale.index_select(
+                            0, selected_experts
+                        ).detach().cpu(),
+                    },
+                    os.path.join(
+                        _LING_W2_CAPTURE_DIR,
+                        f"w2-layer-{capture_ordinal:02d}.pt",
+                    ),
+                )
+                logger.warning(
+                    "LING_W2_CAPTURE saved routed-MoE ordinal %d",
+                    capture_ordinal,
+                )
 
         if ling_iu4_decode_eligible and _LING_IU4_DECODE_MODE in (
             "w2", "w2_residual2", "w2_residual3", "w2_residual4"
