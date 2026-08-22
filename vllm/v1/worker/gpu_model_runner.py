@@ -688,7 +688,7 @@ class GPUModelRunner(
         self.ling_ngram_loop_breaks = 0
         if self.ling_ngram_loop_breaker:
             logger.info(
-                "Ling ngram loop breaker enabled: block third 12-token suffix repeat"
+                "Ling ngram loop breaker enabled: escape low-diversity token cycles"
             )
         if (
             os.getenv("VLLM_LING_KAIRIC_EDGE", "0") == "1"
@@ -3780,6 +3780,7 @@ class GPUModelRunner(
         # Update output token ids with tokens sampled in last step
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
+        logits = self._ling_break_low_diversity_cycle(logits)
         if spec_decode_metadata is None:
             return self.sampler(
                 logits=logits,
@@ -3801,69 +3802,44 @@ class GPUModelRunner(
         )
         return sampler_output
 
-    def _ling_break_repeated_ngram(
-        self,
-        valid_sampled_token_ids: list[list[int]],
-        sampled_token_ids: torch.Tensor,
-        logits: torch.Tensor | None,
-        logprobs_tensors: LogprobsTensors | None,
-    ) -> None:
+    def _ling_break_low_diversity_cycle(
+        self, logits: torch.Tensor | None
+    ) -> torch.Tensor | None:
         if (
             not self.ling_ngram_loop_breaker
             or self.speculative_config is not None
             or logits is None
-            or logprobs_tensors is not None
-            or sampled_token_ids.shape[-1] != 1
         ):
-            return
+            return logits
 
-        ngram = 12
-
-        def repeats_twice(history: list[int], candidate: int) -> bool:
-            if len(history) + 1 < ngram * 3:
-                return False
-            sequence = history + [candidate]
-            suffix = sequence[-ngram:]
-            previous_occurrences = 0
-            for start in range(0, len(sequence) - ngram):
-                if sequence[start : start + ngram] == suffix:
-                    previous_occurrences += 1
-                    if previous_occurrences >= 2:
-                        return True
-            return False
-
-        for req_idx, sampled_ids in enumerate(valid_sampled_token_ids):
-            if len(sampled_ids) != 1:
+        for req_idx, req_id in enumerate(self.input_batch.req_ids):
+            history = self.requests[req_id].output_token_ids
+            if len(history) < 32:
                 continue
-            num_tokens = int(self.input_batch.num_tokens_no_spec[req_idx])
-            history = self.input_batch.token_ids_cpu[
-                req_idx, :num_tokens
-            ].tolist()
-            proposed = sampled_ids[0]
-            if not repeats_twice(history, proposed):
+            window = history[-64:]
+            recent_tokens = set(window)
+            if len(recent_tokens) > 12:
                 continue
-            candidates = torch.topk(logits[req_idx], k=32).indices.tolist()
-            replacement = next(
-                (
-                    int(candidate)
-                    for candidate in candidates
-                    if int(candidate) != proposed
-                    and not repeats_twice(history, int(candidate))
-                ),
-                None,
-            )
-            if replacement is None:
+            fourgram_counts: dict[tuple[int, ...], int] = defaultdict(int)
+            for start in range(len(window) - 3):
+                fourgram_counts[tuple(window[start : start + 4])] += 1
+            max_repeats = max(fourgram_counts.values(), default=0)
+            if max_repeats < 8:
                 continue
-            sampled_ids[0] = replacement
-            sampled_token_ids[req_idx, 0] = replacement
+            # Forbid only the tiny cycling vocabulary for this one step. The
+            # next sampling step is unconstrained unless the model falls back
+            # into another low-diversity cycle. This is not an output cap.
+            logits[req_idx, list(recent_tokens)] = float("-inf")
             self.ling_ngram_loop_breaks += 1
             logger.info(
-                "LING_NGRAM_LOOP_BREAK count=%d req=%s token=%d->%d",
+                "LING_NGRAM_LOOP_BREAK count=%d req=%s unique=%d "
+                "max_fourgram_repeats=%d",
                 self.ling_ngram_loop_breaks,
-                self.input_batch.req_ids[req_idx],
-                proposed,
-                replacement,
+                req_id,
+                len(recent_tokens),
+                max_repeats,
             )
+        return logits
 
     def _bookkeeping_sync(
         self,
@@ -3939,12 +3915,6 @@ class GPUModelRunner(
                     discard_sampled_tokens_req_indices,
                     logprobs_tensors=logprobs_tensors,
                 )
-            self._ling_break_repeated_ngram(
-                valid_sampled_token_ids,
-                sampled_token_ids,
-                logits,
-                logprobs_tensors,
-            )
         else:
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
