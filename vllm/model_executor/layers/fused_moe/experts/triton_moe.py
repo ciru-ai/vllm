@@ -72,6 +72,9 @@ _LING_IU4_DECODE_MODE = (
 )
 _LING_IU4_PREFILL_QUANT = os.environ.get("LING_IU4_PREFILL_QUANT", "s4")
 _LING_IU4_W13_CODEBOOK = os.environ.get("LING_IU4_W13_CODEBOOK", "s4")
+_LING_IU4_MIN_TOKENS = int(os.environ.get("VLLM_LING_IU4_MIN_TOKENS", "1"))
+if _LING_IU4_MIN_TOKENS < 1:
+    raise ValueError("VLLM_LING_IU4_MIN_TOKENS must be at least 1")
 _LING_IU4_DECODE_ENABLED = _LING_IU4_DECODE_MODE in (
     "1",
     "full",
@@ -90,8 +93,9 @@ if _LING_IU4_DECODE_ENABLED:
     if _LING_IU4_DIRECT_OUT:
         logger.warning(
             "LING_IU4_DIRECT_OUT enabled: zero-copy native output with "
-            "%s activation quantization",
+            "%s activation quantization at M >= %d",
             _LING_IU4_PREFILL_QUANT,
+            _LING_IU4_MIN_TOKENS,
         )
 
 
@@ -805,6 +809,7 @@ class TritonWNA16Experts(TritonExperts):
 
         ling_iu4_common_eligible = (
             _LING_IU4_DECODE_ENABLED
+            and num_tokens >= _LING_IU4_MIN_TOKENS
             and current_platform.is_rocm()
             and hidden_states.dtype == torch.bfloat16
             and output.dtype == torch.bfloat16
