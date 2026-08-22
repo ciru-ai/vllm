@@ -683,12 +683,12 @@ class GPUModelRunner(
         self.ling_kairic_burst_resets = 0
         self.ling_kairic_disabled_for_req = False
         self.ling_ngram_loop_breaker = (
-            os.getenv("VLLM_LING_NGRAM_LOOP_BREAKER", "0") == "1"
+            os.getenv("LING_NGRAM_LOOP_BREAKER", "0") == "1"
         )
         self.ling_ngram_loop_breaks = 0
         if self.ling_ngram_loop_breaker:
             logger.info(
-                "Ling ngram loop breaker enabled: block third 24-token suffix repeat"
+                "Ling ngram loop breaker enabled: block third 12-token suffix repeat"
             )
         if (
             os.getenv("VLLM_LING_KAIRIC_EDGE", "0") == "1"
@@ -3817,8 +3817,7 @@ class GPUModelRunner(
         ):
             return
 
-        output_histories = self.input_batch.sampling_metadata.output_token_ids
-        ngram = 24
+        ngram = 12
 
         def repeats_twice(history: list[int], candidate: int) -> bool:
             if len(history) + 1 < ngram * 3:
@@ -3836,7 +3835,10 @@ class GPUModelRunner(
         for req_idx, sampled_ids in enumerate(valid_sampled_token_ids):
             if len(sampled_ids) != 1:
                 continue
-            history = output_histories[req_idx]
+            num_tokens = int(self.input_batch.num_tokens_no_spec[req_idx])
+            history = self.input_batch.token_ids_cpu[
+                req_idx, :num_tokens
+            ].tolist()
             proposed = sampled_ids[0]
             if not repeats_twice(history, proposed):
                 continue
