@@ -75,6 +75,18 @@ _LING_IU4_W13_CODEBOOK = os.environ.get("LING_IU4_W13_CODEBOOK", "s4")
 _LING_IU4_MIN_TOKENS = int(os.environ.get("VLLM_LING_IU4_MIN_TOKENS", "1"))
 if _LING_IU4_MIN_TOKENS < 1:
     raise ValueError("VLLM_LING_IU4_MIN_TOKENS must be at least 1")
+_LING_IU4_LAYER_WINDOW_TEXT = os.environ.get("VLLM_LING_IU4_LAYER_WINDOW", "")
+if _LING_IU4_LAYER_WINDOW_TEXT:
+    _window_parts = _LING_IU4_LAYER_WINDOW_TEXT.split(":", 1)
+    if len(_window_parts) != 2:
+        raise ValueError("VLLM_LING_IU4_LAYER_WINDOW must be START:END")
+    _LING_IU4_LAYER_WINDOW = (int(_window_parts[0]), int(_window_parts[1]))
+    if not 0 <= _LING_IU4_LAYER_WINDOW[0] < _LING_IU4_LAYER_WINDOW[1] <= 41:
+        raise ValueError("VLLM_LING_IU4_LAYER_WINDOW must satisfy 0<=START<END<=41")
+else:
+    _LING_IU4_LAYER_WINDOW = None
+_LING_IU4_WEIGHT_ORDINALS: dict[int, int] = {}
+_LING_IU4_LOGGED_ORDINALS: set[int] = set()
 _LING_IU4_DECODE_ENABLED = _LING_IU4_DECODE_MODE in (
     "1",
     "full",
@@ -97,6 +109,11 @@ if _LING_IU4_DECODE_ENABLED:
             _LING_IU4_PREFILL_QUANT,
             _LING_IU4_MIN_TOKENS,
         )
+        if _LING_IU4_LAYER_WINDOW is not None:
+            logger.warning(
+                "LING_IU4 layer window enabled: routed-MoE ordinals [%d,%d)",
+                *_LING_IU4_LAYER_WINDOW,
+            )
 
 
 def _use_wna16_naive_block_assignment(
@@ -409,6 +426,25 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
 
         if global_num_experts == -1:
             global_num_experts = E
+
+        ling_iu4_layer_selected = True
+        if _LING_IU4_DECODE_ENABLED and _LING_IU4_LAYER_WINDOW is not None:
+            weight_key = w1.data_ptr()
+            layer_ordinal = _LING_IU4_WEIGHT_ORDINALS.get(weight_key)
+            if layer_ordinal is None:
+                layer_ordinal = len(_LING_IU4_WEIGHT_ORDINALS)
+                _LING_IU4_WEIGHT_ORDINALS[weight_key] = layer_ordinal
+            ling_iu4_layer_selected = (
+                _LING_IU4_LAYER_WINDOW[0]
+                <= layer_ordinal
+                < _LING_IU4_LAYER_WINDOW[1]
+            )
+            if (
+                ling_iu4_layer_selected
+                and layer_ordinal not in _LING_IU4_LOGGED_ORDINALS
+            ):
+                _LING_IU4_LOGGED_ORDINALS.add(layer_ordinal)
+                logger.warning("LING_IU4 selected routed-MoE ordinal %d", layer_ordinal)
 
         config = try_get_optimal_moe_config(
             w1.size(),
@@ -810,6 +846,7 @@ class TritonWNA16Experts(TritonExperts):
         ling_iu4_common_eligible = (
             _LING_IU4_DECODE_ENABLED
             and num_tokens >= _LING_IU4_MIN_TOKENS
+            and ling_iu4_layer_selected
             and current_platform.is_rocm()
             and hidden_states.dtype == torch.bfloat16
             and output.dtype == torch.bfloat16
