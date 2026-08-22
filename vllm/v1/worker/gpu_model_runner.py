@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -664,6 +665,32 @@ class GPUModelRunner(
                 )
             self.rejection_sampler = RejectionSampler(
                 self.sampler, self.speculative_config, self.device
+            )
+
+        # Ling Kairic Edge is a hybrid proposer: retain the checkpoint's MTP
+        # drafter as the always-synchronized fallback, but prefer an exact
+        # 24-token suffix match only when it supplies a complete 64-token
+        # continuation. The 64-token draft intentionally creates an M65 target
+        # verification batch for the gfx1151 IU4 path.
+        self.ling_kairic_ngram = None
+        self.ling_kairic_ngram_hits = 0
+        self.ling_kairic_ngram_misses = 0
+        if (
+            os.getenv("VLLM_LING_KAIRIC_EDGE", "0") == "1"
+            and self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+        ):
+            from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+
+            self.ling_kairic_ngram = NgramProposer(
+                self.vllm_config,
+                min_n=24,
+                max_n=24,
+                num_draft_tokens=64,
+            )
+            logger.info(
+                "Ling Kairic Edge hybrid enabled: exact ngram 24->64, "
+                "MTP K1 fallback"
             )
 
         self.num_spec_tokens = 0
@@ -5254,8 +5281,14 @@ class GPUModelRunner(
             else:
                 mm_embed_inputs = None
 
+            # Keep Ling's single MTP layer synchronized on every iteration,
+            # including iterations where its proposal is replaced by a full
+            # ngram draft. Never recursively run that layer 64 times.
+            mtp_num_spec_tokens = (
+                1 if self.ling_kairic_ngram is not None else num_spec_tokens_to_schedule
+            )
             draft_token_ids = self.drafter.propose(
-                num_speculative_tokens=num_spec_tokens_to_schedule,
+                num_speculative_tokens=mtp_num_spec_tokens,
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
@@ -5267,7 +5300,37 @@ class GPUModelRunner(
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
             )
-            if hasattr(self.drafter, "take_last_draft_probs"):
+            used_ling_kairic_ngram = False
+            if self.ling_kairic_ngram is not None:
+                if not isinstance(sampled_token_ids, list):
+                    raise RuntimeError(
+                        "Ling Kairic Edge requires "
+                        "disable_padded_drafter_batch=true"
+                    )
+                ngram_draft = self.ling_kairic_ngram.propose(
+                    min(64, num_spec_tokens_to_schedule),
+                    sampled_token_ids,
+                    self.input_batch.num_tokens_no_spec,
+                    self.input_batch.token_ids_cpu,
+                    slot_mappings=slot_mappings,
+                )
+                # The modified policy is all-or-nothing: short continuations
+                # do not displace the MTP fallback.
+                if len(ngram_draft) == 1 and len(ngram_draft[0]) == 64:
+                    draft_token_ids = ngram_draft
+                    used_ling_kairic_ngram = True
+                    self.ling_kairic_ngram_hits += 1
+                    logger.info(
+                        "LING_KAIRIC_NGRAM hit=%d miss=%d draft=64",
+                        self.ling_kairic_ngram_hits,
+                        self.ling_kairic_ngram_misses,
+                    )
+                else:
+                    self.ling_kairic_ngram_misses += 1
+            if (
+                not used_ling_kairic_ngram
+                and hasattr(self.drafter, "take_last_draft_probs")
+            ):
                 draft_probs = self.drafter.take_last_draft_probs()
                 if draft_probs is not None:
                     self._draft_probs = draft_probs
