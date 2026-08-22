@@ -91,6 +91,7 @@ _LING_IU4_DECODE_ENABLED = _LING_IU4_DECODE_MODE in (
     "1",
     "full",
     "w2",
+    "w2_residual4",
     "grouped",
     "grouped_tiled",
 )
@@ -887,8 +888,11 @@ class TritonWNA16Experts(TritonExperts):
             1,
             2,
             3,
-        ) and _LING_IU4_PREFILL_QUANT not in (
-            "asym_u4", "residual2", "residual3", "residual4"
+        ) and (
+            _LING_IU4_DECODE_MODE == "w2_residual4"
+            or _LING_IU4_PREFILL_QUANT not in (
+                "asym_u4", "residual2", "residual3", "residual4"
+            )
         )
         ling_iu4_grouped_eligible = (
             ling_iu4_common_eligible
@@ -1106,8 +1110,15 @@ class TritonWNA16Experts(TritonExperts):
             activation, intermediate_cache2, intermediate_cache1.view(-1, N)
         )
 
-        if ling_iu4_decode_eligible and _LING_IU4_DECODE_MODE == "w2":
-            candidate = torch.ops.ling_iu4_decode.w2(
+        if ling_iu4_decode_eligible and _LING_IU4_DECODE_MODE in (
+            "w2", "w2_residual4"
+        ):
+            w2_operator = (
+                torch.ops.ling_iu4_decode.w2_residual4
+                if _LING_IU4_DECODE_MODE == "w2_residual4"
+                else torch.ops.ling_iu4_decode.w2
+            )
+            candidate = w2_operator(
                 intermediate_cache2,
                 w2.view(torch.int32),
                 self.w2_scale,
