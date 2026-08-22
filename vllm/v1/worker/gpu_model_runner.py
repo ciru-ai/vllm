@@ -679,6 +679,9 @@ class GPUModelRunner(
         self.ling_kairic_low_accept_streak = 0
         self.ling_kairic_ngram_cooldown = 0
         self.ling_kairic_consecutive_hits = 0
+        self.ling_kairic_active_req_id = None
+        self.ling_kairic_burst_resets = 0
+        self.ling_kairic_disabled_for_req = False
         if (
             os.getenv("VLLM_LING_KAIRIC_EDGE", "0") == "1"
             and self.speculative_config is not None
@@ -1635,11 +1638,18 @@ class GPUModelRunner(
             else:
                 self.ling_kairic_low_accept_streak = 0
             if self.ling_kairic_low_accept_streak >= 3:
-                self.ling_kairic_ngram_cooldown = 64
+                self.ling_kairic_burst_resets += 1
+                self.ling_kairic_disabled_for_req = (
+                    self.ling_kairic_burst_resets >= 2
+                )
+                self.ling_kairic_ngram_cooldown = (
+                    0 if self.ling_kairic_disabled_for_req else 64
+                )
                 self.ling_kairic_low_accept_streak = 0
                 logger.info(
                     "LING_KAIRIC_NGRAM reset: three low-acceptance rounds; "
-                    "MTP cooldown=64"
+                    "disabled_for_request=%s",
+                    self.ling_kairic_disabled_for_req,
                 )
             self.ling_kairic_prev_was_ngram = False
 
@@ -5335,7 +5345,17 @@ class GPUModelRunner(
                         "Ling Kairic Edge requires "
                         "disable_padded_drafter_batch=true"
                     )
-                if self.ling_kairic_ngram_cooldown > 0:
+                active_req_id = self.input_batch.req_ids[0]
+                if active_req_id != self.ling_kairic_active_req_id:
+                    self.ling_kairic_active_req_id = active_req_id
+                    self.ling_kairic_low_accept_streak = 0
+                    self.ling_kairic_ngram_cooldown = 0
+                    self.ling_kairic_consecutive_hits = 0
+                    self.ling_kairic_burst_resets = 0
+                    self.ling_kairic_disabled_for_req = False
+                if self.ling_kairic_disabled_for_req:
+                    ngram_draft = [[]]
+                elif self.ling_kairic_ngram_cooldown > 0:
                     self.ling_kairic_ngram_cooldown -= 1
                     self.ling_kairic_consecutive_hits = 0
                     ngram_draft = [[]]
@@ -5355,10 +5375,18 @@ class GPUModelRunner(
                     self.ling_kairic_prev_was_ngram = True
                     self.ling_kairic_consecutive_hits += 1
                     if self.ling_kairic_consecutive_hits >= 8:
-                        self.ling_kairic_ngram_cooldown = 64
+                        self.ling_kairic_burst_resets += 1
+                        self.ling_kairic_disabled_for_req = (
+                            self.ling_kairic_burst_resets >= 2
+                        )
+                        self.ling_kairic_ngram_cooldown = (
+                            0 if self.ling_kairic_disabled_for_req else 64
+                        )
                         self.ling_kairic_consecutive_hits = 0
                         logger.info(
-                            "LING_KAIRIC_NGRAM burst limit reached; MTP cooldown=64"
+                            "LING_KAIRIC_NGRAM burst limit reached; "
+                            "disabled_for_request=%s",
+                            self.ling_kairic_disabled_for_req,
                         )
                     self.ling_kairic_ngram_hits += 1
                     logger.info(
