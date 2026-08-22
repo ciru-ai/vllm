@@ -845,7 +845,7 @@ class TritonWNA16Experts(TritonExperts):
             1,
             2,
             3,
-        )
+        ) and _LING_IU4_PREFILL_QUANT != "asym_u4"
         ling_iu4_grouped_eligible = (
             ling_iu4_common_eligible
             and _LING_IU4_DECODE_MODE in ("grouped", "grouped_tiled")
