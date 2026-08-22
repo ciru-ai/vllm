@@ -1687,7 +1687,86 @@ def convert_to_wna16_moe_kernel_format(
                 )
                 return tiled_weight, tiled_scale
 
-            w13_uint8, w13_scale = tile_g32_n32(w13_uint8, w13_scale)
+            def tile_affine_s2_g32_n32(
+                weight: torch.Tensor, scale: torch.Tensor
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                """Requantize official S4 codes into a cheap affine S2 codebook.
+
+                Each output/G32 group independently chooses one of two mirrored
+                four-level sets: {-7,-3,1,5} or {-5,-1,3,7}. The choice is
+                stored in the otherwise-unused sign bit of the positive BF16
+                weight scale. Two-bit indices are packed contiguously in the
+                first half of the existing parameter allocation; the remainder
+                is left zero so vLLM's resident tensor contract stays unchanged.
+                """
+                experts, outputs, packed_bytes = weight.shape
+                groups = scale.shape[2]
+                assert outputs % 32 == 0
+                assert packed_bytes == groups * 16
+                source = weight.view(torch.int32).view(
+                    experts, outputs, groups, 4
+                )
+                error_negative = torch.zeros(
+                    (experts, outputs, groups),
+                    dtype=torch.int32,
+                    device=weight.device,
+                )
+                error_positive = torch.zeros_like(error_negative)
+                for word_index in range(4):
+                    word = source[..., word_index]
+                    for nibble_index in range(8):
+                        nibble = (word >> (4 * nibble_index)) & 0xF
+                        value = nibble - 8
+                        index_negative = nibble >> 2
+                        index_positive = torch.clamp((nibble + 2) >> 2, max=3)
+                        delta_negative = value - (index_negative * 4 - 7)
+                        delta_positive = value - (index_positive * 4 - 5)
+                        error_negative.add_(delta_negative * delta_negative)
+                        error_positive.add_(delta_positive * delta_positive)
+                positive_tail = error_positive < error_negative
+
+                packed_s2 = torch.zeros(
+                    (experts, outputs, groups, 2),
+                    dtype=torch.int32,
+                    device=weight.device,
+                )
+                for half in range(2):
+                    packed_half = packed_s2[..., half]
+                    for value_index in range(16):
+                        word = source[..., half * 2 + value_index // 8]
+                        nibble = (word >> (4 * (value_index & 7))) & 0xF
+                        index_negative = nibble >> 2
+                        index_positive = torch.clamp((nibble + 2) >> 2, max=3)
+                        index = torch.where(
+                            positive_tail, index_positive, index_negative
+                        )
+                        packed_half.bitwise_or_(index << (2 * value_index))
+
+                tiled_s2 = (
+                    packed_s2.view(
+                        experts, outputs // 32, 32, groups, 2
+                    )
+                    .permute(0, 1, 3, 4, 2)
+                    .contiguous()
+                )
+                tiled_weight = torch.zeros_like(weight)
+                tiled_words = tiled_weight.view(torch.int32).flatten()
+                tiled_words[: tiled_s2.numel()].copy_(tiled_s2.flatten())
+                signed_scale = torch.where(positive_tail, -scale, scale)
+                tiled_scale = (
+                    signed_scale.view(experts, outputs // 32, 32, groups)
+                    .permute(0, 1, 3, 2)
+                    .contiguous()
+                    .view_as(scale)
+                )
+                return tiled_weight, tiled_scale
+
+            if os.environ.get("LING_IU4_W13_CODEBOOK") == "affine_s2":
+                w13_uint8, w13_scale = tile_affine_s2_g32_n32(
+                    w13_uint8, w13_scale
+                )
+            else:
+                w13_uint8, w13_scale = tile_g32_n32(w13_uint8, w13_scale)
             w2_uint8, w2_scale = tile_g32_n32(w2_uint8, w2_scale)
         return (
             w13_uint8,
