@@ -64,8 +64,17 @@ from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 
 logger = logging.getLogger(__name__)
-_LING_IU4_DECODE_MODE = os.environ.get("VLLM_LING_IU4_DECODE", "")
-_LING_IU4_PREFILL_QUANT = os.environ.get("LING_IU4_PREFILL_QUANT", "s4")
+_LING_KAIRIC_EDGE = os.environ.get("VLLM_LING_KAIRIC_EDGE", "") == "1"
+_LING_IU4_DECODE_MODE = (
+    "grouped_tiled"
+    if _LING_KAIRIC_EDGE
+    else os.environ.get("VLLM_LING_IU4_DECODE", "")
+)
+_LING_IU4_PREFILL_QUANT = (
+    "s4_g16"
+    if _LING_KAIRIC_EDGE
+    else os.environ.get("LING_IU4_PREFILL_QUANT", "s4")
+)
 _LING_IU4_W13_CODEBOOK = os.environ.get("LING_IU4_W13_CODEBOOK", "s4")
 _LING_IU4_DECODE_ENABLED = _LING_IU4_DECODE_MODE in (
     "1",
@@ -82,6 +91,11 @@ if _LING_IU4_DECODE_ENABLED:
         )
     torch.ops.load_library(_ling_iu4_library)
     logger.warning("Loaded experimental Ling gfx1151 IU4 operator: %s", _ling_iu4_library)
+    if _LING_KAIRIC_EDGE:
+        logger.warning(
+            "LING_KAIRIC_EDGE enabled: zero-copy native output, S4/G16 Prompt "
+            "Forge, and zero-copy Dual View weights"
+        )
 
 
 def _use_wna16_naive_block_assignment(
@@ -841,6 +855,18 @@ class TritonWNA16Experts(TritonExperts):
             and num_tokens >= 1
         )
         if ling_iu4_decode_eligible and _LING_IU4_DECODE_MODE == "grouped_tiled":
+            if _LING_KAIRIC_EDGE and _LING_IU4_W13_CODEBOOK != "affine_s2":
+                torch.ops.ling_iu4_decode.moe_tiled_out(
+                    hidden_states,
+                    w1.view(torch.int32),
+                    self.w1_scale,
+                    w2.view(torch.int32),
+                    self.w2_scale,
+                    topk_ids,
+                    topk_weights,
+                    output,
+                )
+                return
             decode_operator = (
                 torch.ops.ling_iu4_decode.moe_tiled_s2w13
                 if _LING_IU4_W13_CODEBOOK == "affine_s2"
@@ -912,19 +938,38 @@ class TritonWNA16Experts(TritonExperts):
                 grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_tiled_g16
             else:
                 grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_tiled
-            candidate = grouped_operator(
-                hidden_states,
-                w1.view(torch.int32),
-                self.w1_scale,
-                w2.view(torch.int32),
-                self.w2_scale,
-                topk_ids,
-                topk_weights,
-                grouped_token_ids,
-                grouped_expert_ids,
-                grouped_post_padded,
-            )
-            output.copy_(candidate)
+            if (
+                _LING_KAIRIC_EDGE
+                and _LING_IU4_PREFILL_QUANT == "s4_g16"
+                and _LING_IU4_W13_CODEBOOK != "affine_s2"
+            ):
+                torch.ops.ling_iu4_decode.grouped_moe_tiled_g16_out(
+                    hidden_states,
+                    w1.view(torch.int32),
+                    self.w1_scale,
+                    w2.view(torch.int32),
+                    self.w2_scale,
+                    topk_ids,
+                    topk_weights,
+                    grouped_token_ids,
+                    grouped_expert_ids,
+                    grouped_post_padded,
+                    output,
+                )
+            else:
+                candidate = grouped_operator(
+                    hidden_states,
+                    w1.view(torch.int32),
+                    self.w1_scale,
+                    w2.view(torch.int32),
+                    self.w2_scale,
+                    topk_ids,
+                    topk_weights,
+                    grouped_token_ids,
+                    grouped_expert_ids,
+                    grouped_post_padded,
+                )
+                output.copy_(candidate)
             return
 
         # Note that the output tensor might be in workspace1
