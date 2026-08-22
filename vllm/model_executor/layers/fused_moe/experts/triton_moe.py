@@ -846,7 +846,7 @@ class TritonWNA16Experts(TritonExperts):
             2,
             3,
         ) and _LING_IU4_PREFILL_QUANT not in (
-            "asym_u4", "residual2", "residual3"
+            "asym_u4", "residual2", "residual3", "residual4"
         )
         ling_iu4_grouped_eligible = (
             ling_iu4_common_eligible
@@ -941,6 +941,8 @@ class TritonWNA16Experts(TritonExperts):
                 grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_tiled_r2
             elif _LING_IU4_PREFILL_QUANT == "residual3":
                 grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_tiled_r3
+            elif _LING_IU4_PREFILL_QUANT == "residual4":
+                grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_tiled_r4
             elif _LING_IU4_PREFILL_QUANT == "s4_g16":
                 grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_tiled_g16
             else:
@@ -948,7 +950,7 @@ class TritonWNA16Experts(TritonExperts):
             if (
                 _LING_IU4_DIRECT_OUT
                 and _LING_IU4_PREFILL_QUANT in (
-                    "s4", "s4_g16", "residual2", "residual3"
+                    "s4", "s4_g16", "residual2", "residual3", "residual4"
                 )
                 and _LING_IU4_W13_CODEBOOK != "affine_s2"
             ):
@@ -963,6 +965,10 @@ class TritonWNA16Experts(TritonExperts):
                 elif _LING_IU4_PREFILL_QUANT == "residual3":
                     grouped_out_operator = (
                         torch.ops.ling_iu4_decode.grouped_moe_tiled_r3_out
+                    )
+                elif _LING_IU4_PREFILL_QUANT == "residual4":
+                    grouped_out_operator = (
+                        torch.ops.ling_iu4_decode.grouped_moe_tiled_r4_out
                     )
                 else:
                     grouped_out_operator = (
