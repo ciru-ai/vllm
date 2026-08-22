@@ -891,16 +891,14 @@ class TritonWNA16Experts(TritonExperts):
             grouped_token_ids, grouped_expert_ids, grouped_post_padded = (
                 moe_align_block_size(topk_ids, 16, global_num_experts, expert_map)
             )
-            grouped_operator = (
-                torch.ops.ling_iu4_decode.grouped_moe_tiled_u4
-                if _LING_IU4_DECODE_MODE == "grouped_tiled"
-                and _LING_IU4_PREFILL_QUANT == "asym_u4"
-                else (
-                    torch.ops.ling_iu4_decode.grouped_moe_tiled
-                    if _LING_IU4_DECODE_MODE == "grouped_tiled"
-                    else torch.ops.ling_iu4_decode.grouped_moe
-                )
-            )
+            if _LING_IU4_DECODE_MODE != "grouped_tiled":
+                grouped_operator = torch.ops.ling_iu4_decode.grouped_moe
+            elif _LING_IU4_PREFILL_QUANT == "asym_u4":
+                grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_tiled_u4
+            elif _LING_IU4_PREFILL_QUANT == "s4_g16":
+                grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_tiled_g16
+            else:
+                grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_tiled
             candidate = grouped_operator(
                 hidden_states,
                 w1.view(torch.int32),
