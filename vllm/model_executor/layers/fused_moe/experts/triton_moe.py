@@ -70,11 +70,7 @@ _LING_IU4_DECODE_MODE = (
     if _LING_IU4_DIRECT_OUT
     else os.environ.get("VLLM_LING_IU4_DECODE", "")
 )
-_LING_IU4_PREFILL_QUANT = (
-    "s4_g16"
-    if _LING_IU4_DIRECT_OUT
-    else os.environ.get("LING_IU4_PREFILL_QUANT", "s4")
-)
+_LING_IU4_PREFILL_QUANT = os.environ.get("LING_IU4_PREFILL_QUANT", "s4")
 _LING_IU4_W13_CODEBOOK = os.environ.get("LING_IU4_W13_CODEBOOK", "s4")
 _LING_IU4_DECODE_ENABLED = _LING_IU4_DECODE_MODE in (
     "1",
@@ -94,7 +90,8 @@ if _LING_IU4_DECODE_ENABLED:
     if _LING_IU4_DIRECT_OUT:
         logger.warning(
             "LING_IU4_DIRECT_OUT enabled: zero-copy native output with "
-            "S4/G16 activation quantization"
+            "%s activation quantization",
+            _LING_IU4_PREFILL_QUANT,
         )
 
 
@@ -855,7 +852,11 @@ class TritonWNA16Experts(TritonExperts):
             and num_tokens >= 1
         )
         if ling_iu4_decode_eligible and _LING_IU4_DECODE_MODE == "grouped_tiled":
-            if _LING_IU4_DIRECT_OUT and _LING_IU4_W13_CODEBOOK != "affine_s2":
+            if (
+                _LING_IU4_DIRECT_OUT
+                and _LING_IU4_PREFILL_QUANT in ("s4", "s4_g16")
+                and _LING_IU4_W13_CODEBOOK != "affine_s2"
+            ):
                 torch.ops.ling_iu4_decode.moe_tiled_out(
                     hidden_states,
                     w1.view(torch.int32),
@@ -938,12 +939,13 @@ class TritonWNA16Experts(TritonExperts):
                 grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_tiled_g16
             else:
                 grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_tiled
-            if (
-                _LING_IU4_DIRECT_OUT
-                and _LING_IU4_PREFILL_QUANT == "s4_g16"
-                and _LING_IU4_W13_CODEBOOK != "affine_s2"
-            ):
-                torch.ops.ling_iu4_decode.grouped_moe_tiled_g16_out(
+            if _LING_IU4_DIRECT_OUT and _LING_IU4_W13_CODEBOOK != "affine_s2":
+                grouped_out_operator = (
+                    torch.ops.ling_iu4_decode.grouped_moe_tiled_g16_out
+                    if _LING_IU4_PREFILL_QUANT == "s4_g16"
+                    else torch.ops.ling_iu4_decode.grouped_moe_tiled_out
+                )
+                grouped_out_operator(
                     hidden_states,
                     w1.view(torch.int32),
                     self.w1_scale,
