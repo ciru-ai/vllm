@@ -678,6 +678,7 @@ class GPUModelRunner(
         self.ling_kairic_prev_was_ngram = False
         self.ling_kairic_low_accept_streak = 0
         self.ling_kairic_ngram_cooldown = 0
+        self.ling_kairic_consecutive_hits = 0
         if (
             os.getenv("VLLM_LING_KAIRIC_EDGE", "0") == "1"
             and self.speculative_config is not None
@@ -5336,6 +5337,7 @@ class GPUModelRunner(
                     )
                 if self.ling_kairic_ngram_cooldown > 0:
                     self.ling_kairic_ngram_cooldown -= 1
+                    self.ling_kairic_consecutive_hits = 0
                     ngram_draft = [[]]
                 else:
                     ngram_draft = self.ling_kairic_ngram.propose(
@@ -5351,6 +5353,13 @@ class GPUModelRunner(
                     draft_token_ids = ngram_draft
                     used_ling_kairic_ngram = True
                     self.ling_kairic_prev_was_ngram = True
+                    self.ling_kairic_consecutive_hits += 1
+                    if self.ling_kairic_consecutive_hits >= 8:
+                        self.ling_kairic_ngram_cooldown = 64
+                        self.ling_kairic_consecutive_hits = 0
+                        logger.info(
+                            "LING_KAIRIC_NGRAM burst limit reached; MTP cooldown=64"
+                        )
                     self.ling_kairic_ngram_hits += 1
                     logger.info(
                         "LING_KAIRIC_NGRAM hit=%d miss=%d draft=64",
@@ -5359,6 +5368,7 @@ class GPUModelRunner(
                     )
                 else:
                     self.ling_kairic_ngram_misses += 1
+                    self.ling_kairic_consecutive_hits = 0
             if (
                 not used_ling_kairic_ngram
                 and hasattr(self.drafter, "take_last_draft_probs")
