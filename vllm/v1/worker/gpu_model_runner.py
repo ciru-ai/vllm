@@ -682,6 +682,14 @@ class GPUModelRunner(
         self.ling_kairic_active_req_id = None
         self.ling_kairic_burst_resets = 0
         self.ling_kairic_disabled_for_req = False
+        self.ling_ngram_loop_breaker = (
+            os.getenv("VLLM_LING_NGRAM_LOOP_BREAKER", "0") == "1"
+        )
+        self.ling_ngram_loop_breaks = 0
+        if self.ling_ngram_loop_breaker:
+            logger.info(
+                "Ling ngram loop breaker enabled: block third 24-token suffix repeat"
+            )
         if (
             os.getenv("VLLM_LING_KAIRIC_EDGE", "0") == "1"
             and self.speculative_config is not None
@@ -3793,6 +3801,68 @@ class GPUModelRunner(
         )
         return sampler_output
 
+    def _ling_break_repeated_ngram(
+        self,
+        valid_sampled_token_ids: list[list[int]],
+        sampled_token_ids: torch.Tensor,
+        logits: torch.Tensor | None,
+        logprobs_tensors: LogprobsTensors | None,
+    ) -> None:
+        if (
+            not self.ling_ngram_loop_breaker
+            or self.speculative_config is not None
+            or logits is None
+            or logprobs_tensors is not None
+            or sampled_token_ids.shape[-1] != 1
+        ):
+            return
+
+        output_histories = self.input_batch.sampling_metadata.output_token_ids
+        ngram = 24
+
+        def repeats_twice(history: list[int], candidate: int) -> bool:
+            if len(history) + 1 < ngram * 3:
+                return False
+            sequence = history + [candidate]
+            suffix = sequence[-ngram:]
+            previous_occurrences = 0
+            for start in range(0, len(sequence) - ngram):
+                if sequence[start : start + ngram] == suffix:
+                    previous_occurrences += 1
+                    if previous_occurrences >= 2:
+                        return True
+            return False
+
+        for req_idx, sampled_ids in enumerate(valid_sampled_token_ids):
+            if len(sampled_ids) != 1:
+                continue
+            history = output_histories[req_idx]
+            proposed = sampled_ids[0]
+            if not repeats_twice(history, proposed):
+                continue
+            candidates = torch.topk(logits[req_idx], k=32).indices.tolist()
+            replacement = next(
+                (
+                    int(candidate)
+                    for candidate in candidates
+                    if int(candidate) != proposed
+                    and not repeats_twice(history, int(candidate))
+                ),
+                None,
+            )
+            if replacement is None:
+                continue
+            sampled_ids[0] = replacement
+            sampled_token_ids[req_idx, 0] = replacement
+            self.ling_ngram_loop_breaks += 1
+            logger.info(
+                "LING_NGRAM_LOOP_BREAK count=%d req=%s token=%d->%d",
+                self.ling_ngram_loop_breaks,
+                self.input_batch.req_ids[req_idx],
+                proposed,
+                replacement,
+            )
+
     def _bookkeeping_sync(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3867,6 +3937,12 @@ class GPUModelRunner(
                     discard_sampled_tokens_req_indices,
                     logprobs_tensors=logprobs_tensors,
                 )
+            self._ling_break_repeated_ngram(
+                valid_sampled_token_ids,
+                sampled_token_ids,
+                logits,
+                logprobs_tensors,
+            )
         else:
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
