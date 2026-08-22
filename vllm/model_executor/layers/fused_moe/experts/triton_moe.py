@@ -65,7 +65,12 @@ from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 logger = logging.getLogger(__name__)
 _LING_IU4_DECODE_MODE = os.environ.get("VLLM_LING_IU4_DECODE", "")
-_LING_IU4_DECODE_ENABLED = _LING_IU4_DECODE_MODE in ("1", "full", "w2")
+_LING_IU4_DECODE_ENABLED = _LING_IU4_DECODE_MODE in (
+    "1",
+    "full",
+    "w2",
+    "grouped",
+)
 if _LING_IU4_DECODE_ENABLED:
     _ling_iu4_library = os.environ.get("VLLM_LING_IU4_LIBRARY")
     if not _ling_iu4_library:
@@ -73,7 +78,7 @@ if _LING_IU4_DECODE_ENABLED:
             "VLLM_LING_IU4_LIBRARY is required when VLLM_LING_IU4_DECODE=1"
         )
     torch.ops.load_library(_ling_iu4_library)
-    logger.warning("Loaded experimental Ling gfx1151 decode IU4 operator: %s", _ling_iu4_library)
+    logger.warning("Loaded experimental Ling gfx1151 IU4 operator: %s", _ling_iu4_library)
 
 
 def _use_wna16_naive_block_assignment(
@@ -784,12 +789,11 @@ class TritonWNA16Experts(TritonExperts):
         if global_num_experts == -1:
             global_num_experts = E
 
-        ling_iu4_decode_eligible = (
+        ling_iu4_common_eligible = (
             _LING_IU4_DECODE_ENABLED
             and current_platform.is_rocm()
             and hidden_states.dtype == torch.bfloat16
             and output.dtype == torch.bfloat16
-            and num_tokens in (1, 2, 3)
             and E == 512
             and global_num_experts == 512
             and top_k_num == 8
@@ -822,6 +826,16 @@ class TritonWNA16Experts(TritonExperts):
             and topk_ids.is_contiguous()
             and topk_weights.dtype == torch.float32
             and topk_weights.is_contiguous()
+        )
+        ling_iu4_decode_eligible = ling_iu4_common_eligible and num_tokens in (
+            1,
+            2,
+            3,
+        )
+        ling_iu4_grouped_eligible = (
+            ling_iu4_common_eligible
+            and _LING_IU4_DECODE_MODE == "grouped"
+            and num_tokens >= 16
         )
         if ling_iu4_decode_eligible and _LING_IU4_DECODE_MODE in ("1", "full"):
             candidate = torch.ops.ling_iu4_decode.moe(
@@ -858,6 +872,25 @@ class TritonWNA16Experts(TritonExperts):
             compute_type = tl.bfloat16
         else:
             raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
+
+        if ling_iu4_grouped_eligible:
+            grouped_token_ids, grouped_expert_ids, grouped_post_padded = (
+                moe_align_block_size(topk_ids, 16, global_num_experts, expert_map)
+            )
+            candidate = torch.ops.ling_iu4_decode.grouped_moe(
+                hidden_states,
+                w1.view(torch.int32),
+                self.w1_scale,
+                w2.view(torch.int32),
+                self.w2_scale,
+                topk_ids,
+                topk_weights,
+                grouped_token_ids,
+                grouped_expert_ids,
+                grouped_post_padded,
+            )
+            output.copy_(candidate)
+            return
 
         # Note that the output tensor might be in workspace1
         intermediate_cache1 = _resize_cache(workspace2, (num_tokens, top_k_num, N))
