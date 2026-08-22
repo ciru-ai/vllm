@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import sys
 from enum import Enum
 from typing import Any
@@ -1657,6 +1658,37 @@ def convert_to_wna16_moe_kernel_format(
             # MoeWNA16 uses N-first uint8 weights and scales.
             w13_uint8 = w13.view(torch.uint8)
             w2_uint8 = w2.view(torch.uint8)
+        if os.environ.get("VLLM_LING_IU4_DECODE") == "grouped_tiled":
+            # Replace the scattered [E,N,K] row layout with a Ling/G32 IU4
+            # fragment layout. Every wave then reads 32 output columns as two
+            # contiguous 16-column WMMA fragments. The parameter is replaced,
+            # so this does not retain a second full checkpoint-sized copy.
+            def tile_g32_n32(
+                weight: torch.Tensor, scale: torch.Tensor
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                experts, outputs, packed_bytes = weight.shape
+                groups = scale.shape[2]
+                assert outputs % 32 == 0
+                assert packed_bytes == groups * 16
+                words = weight.view(torch.int32).view(
+                    experts, outputs // 32, 32, groups, 2, 2
+                )
+                tiled_weight = (
+                    words.permute(0, 1, 3, 4, 2, 5)
+                    .contiguous()
+                    .view(torch.uint8)
+                    .view_as(weight)
+                )
+                tiled_scale = (
+                    scale.view(experts, outputs // 32, 32, groups)
+                    .permute(0, 1, 3, 2)
+                    .contiguous()
+                    .view_as(scale)
+                )
+                return tiled_weight, tiled_scale
+
+            w13_uint8, w13_scale = tile_g32_n32(w13_uint8, w13_scale)
+            w2_uint8, w2_scale = tile_g32_n32(w2_uint8, w2_scale)
         return (
             w13_uint8,
             w2_uint8,

@@ -70,6 +70,7 @@ _LING_IU4_DECODE_ENABLED = _LING_IU4_DECODE_MODE in (
     "full",
     "w2",
     "grouped",
+    "grouped_tiled",
 )
 if _LING_IU4_DECODE_ENABLED:
     _ling_iu4_library = os.environ.get("VLLM_LING_IU4_LIBRARY")
@@ -834,8 +835,8 @@ class TritonWNA16Experts(TritonExperts):
         )
         ling_iu4_grouped_eligible = (
             ling_iu4_common_eligible
-            and _LING_IU4_DECODE_MODE == "grouped"
-            and num_tokens >= 16
+            and _LING_IU4_DECODE_MODE in ("grouped", "grouped_tiled")
+            and num_tokens >= 1
         )
         if ling_iu4_decode_eligible and _LING_IU4_DECODE_MODE in ("1", "full"):
             candidate = torch.ops.ling_iu4_decode.moe(
@@ -877,7 +878,12 @@ class TritonWNA16Experts(TritonExperts):
             grouped_token_ids, grouped_expert_ids, grouped_post_padded = (
                 moe_align_block_size(topk_ids, 16, global_num_experts, expert_map)
             )
-            candidate = torch.ops.ling_iu4_decode.grouped_moe(
+            grouped_operator = (
+                torch.ops.ling_iu4_decode.grouped_moe_tiled
+                if _LING_IU4_DECODE_MODE == "grouped_tiled"
+                else torch.ops.ling_iu4_decode.grouped_moe
+            )
+            candidate = grouped_operator(
                 hidden_states,
                 w1.view(torch.int32),
                 self.w1_scale,
