@@ -65,6 +65,7 @@ from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 logger = logging.getLogger(__name__)
 _LING_IU4_DECODE_MODE = os.environ.get("VLLM_LING_IU4_DECODE", "")
+_LING_IU4_PREFILL_QUANT = os.environ.get("LING_IU4_PREFILL_QUANT", "s4")
 _LING_IU4_DECODE_ENABLED = _LING_IU4_DECODE_MODE in (
     "1",
     "full",
@@ -891,9 +892,14 @@ class TritonWNA16Experts(TritonExperts):
                 moe_align_block_size(topk_ids, 16, global_num_experts, expert_map)
             )
             grouped_operator = (
-                torch.ops.ling_iu4_decode.grouped_moe_tiled
+                torch.ops.ling_iu4_decode.grouped_moe_tiled_u4
                 if _LING_IU4_DECODE_MODE == "grouped_tiled"
-                else torch.ops.ling_iu4_decode.grouped_moe
+                and _LING_IU4_PREFILL_QUANT == "asym_u4"
+                else (
+                    torch.ops.ling_iu4_decode.grouped_moe_tiled
+                    if _LING_IU4_DECODE_MODE == "grouped_tiled"
+                    else torch.ops.ling_iu4_decode.grouped_moe
+                )
             )
             candidate = grouped_operator(
                 hidden_states,
