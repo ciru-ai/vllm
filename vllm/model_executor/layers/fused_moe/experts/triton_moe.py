@@ -838,6 +838,18 @@ class TritonWNA16Experts(TritonExperts):
             and _LING_IU4_DECODE_MODE in ("grouped", "grouped_tiled")
             and num_tokens >= 1
         )
+        if ling_iu4_decode_eligible and _LING_IU4_DECODE_MODE == "grouped_tiled":
+            candidate = torch.ops.ling_iu4_decode.moe_tiled(
+                hidden_states,
+                w1.view(torch.int32),
+                self.w1_scale,
+                w2.view(torch.int32),
+                self.w2_scale,
+                topk_ids,
+                topk_weights,
+            )
+            output.copy_(candidate)
+            return
         if ling_iu4_decode_eligible and _LING_IU4_DECODE_MODE in ("1", "full"):
             candidate = torch.ops.ling_iu4_decode.moe(
                 hidden_states,
