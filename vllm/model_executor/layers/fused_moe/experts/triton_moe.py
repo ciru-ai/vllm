@@ -1047,23 +1047,7 @@ class TritonWNA16Experts(TritonExperts):
             assert grouped_token_ids is not None
             assert grouped_expert_ids is not None
             assert grouped_post_padded is not None
-            operator_w1, operator_w2 = w1, w2
-            operator_w1_scale, operator_w2_scale = self.w1_scale, self.w2_scale
-            tiled_companion = None
-            if os.environ.get("VLLM_LING_IU4_COMPANION_LAYERS", ""):
-                from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
-                    get_ling_iu4_tiled_companion,
-                )
-
-                tiled_companion = get_ling_iu4_tiled_companion(w1.data_ptr())
-            if tiled_companion is not None:
-                grouped_operator = (
-                    torch.ops.ling_iu4_decode.grouped_moe_tiled_g16
-                )
-                operator_w1, operator_w2, operator_w1_scale, operator_w2_scale, _ = (
-                    tiled_companion
-                )
-            elif _LING_IU4_DECODE_MODE != "grouped_tiled":
+            if _LING_IU4_DECODE_MODE != "grouped_tiled":
                 if _LING_IU4_PREFILL_QUANT == "residual2":
                     grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_r2
                 elif _LING_IU4_PREFILL_QUANT == "residual3":
@@ -1134,10 +1118,10 @@ class TritonWNA16Experts(TritonExperts):
             else:
                 candidate = grouped_operator(
                     hidden_states,
-                    operator_w1.view(torch.int32),
-                    operator_w1_scale,
-                    operator_w2.view(torch.int32),
-                    operator_w2_scale,
+                    w1.view(torch.int32),
+                    self.w1_scale,
+                    w2.view(torch.int32),
+                    self.w2_scale,
                     topk_ids,
                     topk_weights,
                     grouped_token_ids,
