@@ -1005,7 +1005,14 @@ class TritonWNA16Experts(TritonExperts):
                 moe_align_block_size(topk_ids, 16, global_num_experts, expert_map)
             )
             if _LING_IU4_DECODE_MODE != "grouped_tiled":
-                grouped_operator = torch.ops.ling_iu4_decode.grouped_moe
+                if _LING_IU4_PREFILL_QUANT == "residual2":
+                    grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_r2
+                elif _LING_IU4_PREFILL_QUANT == "residual3":
+                    grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_r3
+                elif _LING_IU4_PREFILL_QUANT == "residual4":
+                    grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_r4
+                else:
+                    grouped_operator = torch.ops.ling_iu4_decode.grouped_moe
             elif (
                 _LING_IU4_PREFILL_QUANT == "s4_g16"
                 and _LING_IU4_W13_CODEBOOK == "affine_s2"
