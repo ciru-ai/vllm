@@ -989,7 +989,21 @@ class TritonWNA16Experts(TritonExperts):
                 )
         if _LING_IU4_TILED_WEIGHTS and not ling_iu4_grouped_eligible:
             raise RuntimeError(
-                "tiled IU4 weights cannot fall through to the row-major W4 kernel"
+                "tiled IU4 weights cannot fall through to the row-major W4 kernel; "
+                f"common={ling_iu4_common_eligible} grouped_candidate="
+                f"{ling_iu4_grouped_candidate} M={num_tokens} layer={layer_ordinal} "
+                f"E={E}/{global_num_experts} topk={top_k_num} N={N} K={K} "
+                f"hidden={hidden_states.dtype}/{hidden_states.is_contiguous()} "
+                f"output={output.dtype} w1={tuple(w1.shape)}/{w1.dtype} "
+                f"w2={tuple(w2.shape)}/{w2.dtype} "
+                f"s1={None if self.w1_scale is None else (tuple(self.w1_scale.shape), self.w1_scale.dtype)} "
+                f"s2={None if self.w2_scale is None else (tuple(self.w2_scale.shape), self.w2_scale.dtype)} "
+                f"block={self.block_shape} activation={activation} "
+                f"expert_map={expert_map is not None} a1={a1q_scale is not None} "
+                f"a2={a2_scale is not None} meta={expert_tokens_meta is not None} "
+                f"router_input={apply_router_weight_on_input} lora={self._lora_context is not None} "
+                f"ids={topk_ids.dtype}/{topk_ids.is_contiguous()} "
+                f"weights={topk_weights.dtype}/{topk_weights.is_contiguous()}"
             )
         if ling_iu4_decode_eligible and _LING_IU4_DECODE_MODE == "grouped_tiled":
             if (
