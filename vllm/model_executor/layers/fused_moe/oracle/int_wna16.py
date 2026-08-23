@@ -95,7 +95,6 @@ def backend_to_kernel_cls(
     elif backend == WNA16MoEBackend.FLASHINFER_TRTLLM:
         return [TrtLlmMxint4ExpertsMonolithic]
     elif backend == WNA16MoEBackend.TRITON:
-        global _LING_IU4_COMPANION_ORDINAL
         return [TritonWNA16Experts]
     elif backend == WNA16MoEBackend.XPU:
         from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
@@ -1468,6 +1467,7 @@ def convert_to_wna16_moe_kernel_format(
         quant_config: the ``QuantizationConfig`` for this layer.
         input_dtype: optional activation dtype, usually should be 16 bit.
     """
+    global _LING_IU4_COMPANION_ORDINAL
     if backend == WNA16MoEBackend.HUMMING:
         from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
         from vllm.model_executor.layers.quantization.utils.humming_utils import (
