@@ -901,7 +901,14 @@ class TritonWNA16Experts(TritonExperts):
             and self.quant_config.w2_zp is None
             and self.block_shape == [0, 32]
             and activation == MoEActivation.SILU
-            and self.activation_config.clamp_limit is None
+            and (
+                self.activation_config.clamp_limit is None
+                or (
+                    _LING_IU4_TILED_WEIGHTS
+                    and _LING_IU4_PREFILL_QUANT == "residual3"
+                    and self.activation_config.clamp_limit == 4.0
+                )
+            )
             and expert_map is None
             and a1q_scale is None
             and a2_scale is None
@@ -1115,7 +1122,11 @@ class TritonWNA16Experts(TritonExperts):
             elif _LING_IU4_PREFILL_QUANT == "residual2":
                 grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_tiled_r2
             elif _LING_IU4_PREFILL_QUANT == "residual3":
-                grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_tiled_r3
+                grouped_operator = (
+                    torch.ops.ling_iu4_decode.grouped_moe_tiled_r3_clamp4
+                    if self.activation_config.clamp_limit == 4.0
+                    else torch.ops.ling_iu4_decode.grouped_moe_tiled_r3
+                )
             elif _LING_IU4_PREFILL_QUANT == "residual4":
                 grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_tiled_r4
             elif _LING_IU4_PREFILL_QUANT == "s4_g16":
