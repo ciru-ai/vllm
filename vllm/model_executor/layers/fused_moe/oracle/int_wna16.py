@@ -1658,7 +1658,12 @@ def convert_to_wna16_moe_kernel_format(
             # MoeWNA16 uses N-first uint8 weights and scales.
             w13_uint8 = w13.view(torch.uint8)
             w2_uint8 = w2.view(torch.uint8)
-        if os.environ.get("VLLM_LING_IU4_DECODE") == "grouped_tiled":
+        if os.environ.get("VLLM_LING_IU4_TILED_WEIGHTS", "0") == "1":
+            if os.environ.get("VLLM_LING_IU4_DECODE") != "grouped_tiled":
+                raise RuntimeError(
+                    "VLLM_LING_IU4_TILED_WEIGHTS=1 requires "
+                    "VLLM_LING_IU4_DECODE=grouped_tiled"
+                )
             # Replace the scattered [E,N,K] row layout with a Ling/G32 IU4
             # fragment layout. Every wave then reads 32 output columns as two
             # contiguous 16-column WMMA fragments. The parameter is replaced,

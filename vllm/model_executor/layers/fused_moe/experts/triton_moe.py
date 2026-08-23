@@ -65,10 +65,9 @@ from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 logger = logging.getLogger(__name__)
 _LING_IU4_DIRECT_OUT = os.environ.get("VLLM_LING_IU4_DIRECT_OUT", "") == "1"
-_LING_IU4_DECODE_MODE = (
-    "grouped_tiled"
-    if _LING_IU4_DIRECT_OUT
-    else os.environ.get("VLLM_LING_IU4_DECODE", "")
+_LING_IU4_DECODE_MODE = os.environ.get("VLLM_LING_IU4_DECODE", "")
+_LING_IU4_TILED_WEIGHTS = (
+    os.environ.get("VLLM_LING_IU4_TILED_WEIGHTS", "0") == "1"
 )
 _LING_IU4_PREFILL_QUANT = os.environ.get("LING_IU4_PREFILL_QUANT", "s4")
 _LING_IU4_W13_CODEBOOK = os.environ.get("LING_IU4_W13_CODEBOOK", "s4")
@@ -85,6 +84,23 @@ if _LING_IU4_LAYER_WINDOW_TEXT:
         raise ValueError("VLLM_LING_IU4_LAYER_WINDOW must satisfy 0<=START<END<=41")
 else:
     _LING_IU4_LAYER_WINDOW = None
+if _LING_IU4_TILED_WEIGHTS and _LING_IU4_DECODE_MODE != "grouped_tiled":
+    raise ValueError(
+        "VLLM_LING_IU4_TILED_WEIGHTS=1 requires grouped_tiled mode"
+    )
+if _LING_IU4_DECODE_MODE == "grouped_tiled" and not _LING_IU4_TILED_WEIGHTS:
+    raise ValueError(
+        "grouped_tiled mode requires explicit VLLM_LING_IU4_TILED_WEIGHTS=1"
+    )
+if _LING_IU4_TILED_WEIGHTS and (
+    _LING_IU4_MIN_TOKENS != 1 or _LING_IU4_LAYER_WINDOW is not None
+):
+    raise ValueError(
+        "tiled weights prohibit token thresholds and layer windows because "
+        "the W4 fallback requires canonical row-major weights"
+    )
+if _LING_IU4_DIRECT_OUT and _LING_IU4_DECODE_MODE != "grouped_tiled":
+    raise ValueError("VLLM_LING_IU4_DIRECT_OUT=1 requires grouped_tiled mode")
 _LING_IU4_WEIGHT_ORDINALS: dict[int, int] = {}
 _LING_IU4_LOGGED_ORDINALS: set[int] = set()
 _LING_W2_CAPTURE_DIR = os.environ.get("LING_W2_CAPTURE_DIR", "")
@@ -832,6 +848,7 @@ class TritonWNA16Experts(TritonExperts):
             global_num_experts = E
 
         ling_iu4_layer_selected = True
+        layer_ordinal = None
         if _LING_IU4_DECODE_ENABLED and _LING_IU4_LAYER_WINDOW is not None:
             weight_key = w1.data_ptr()
             layer_ordinal = _LING_IU4_WEIGHT_ORDINALS.get(weight_key)
@@ -896,8 +913,10 @@ class TritonWNA16Experts(TritonExperts):
             3,
         ) and (
             _LING_IU4_DECODE_MODE in (
-                "w2_residual2", "w2_residual3", "w2_residual3_outlier1",
-                "w2_residual4"
+                "w2_residual2",
+                "w2_residual3",
+                "w2_residual3_outlier1",
+                "w2_residual4",
             )
             or _LING_IU4_PREFILL_QUANT not in (
                 "asym_u4", "residual2", "residual3", "residual4"
@@ -908,6 +927,10 @@ class TritonWNA16Experts(TritonExperts):
             and _LING_IU4_DECODE_MODE in ("grouped", "grouped_tiled")
             and num_tokens >= 1
         )
+        if _LING_IU4_TILED_WEIGHTS and not ling_iu4_grouped_eligible:
+            raise RuntimeError(
+                "tiled IU4 weights cannot fall through to the row-major W4 kernel"
+            )
         if ling_iu4_decode_eligible and _LING_IU4_DECODE_MODE == "grouped_tiled":
             if (
                 _LING_IU4_DIRECT_OUT
@@ -1151,8 +1174,11 @@ class TritonWNA16Experts(TritonExperts):
                 )
 
         if ling_iu4_decode_eligible and _LING_IU4_DECODE_MODE in (
-            "w2", "w2_residual2", "w2_residual3",
-            "w2_residual3_outlier1", "w2_residual4"
+            "w2",
+            "w2_residual2",
+            "w2_residual3",
+            "w2_residual3_outlier1",
+            "w2_residual4",
         ):
             w2_operator = {
                 "w2": torch.ops.ling_iu4_decode.w2,
