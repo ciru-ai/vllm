@@ -905,7 +905,9 @@ class TritonWNA16Experts(TritonExperts):
                 self.activation_config.clamp_limit is None
                 or (
                     _LING_IU4_TILED_WEIGHTS
-                    and _LING_IU4_PREFILL_QUANT in ("s4", "residual3")
+                    and _LING_IU4_PREFILL_QUANT in (
+                        "s4", "residual2", "residual3"
+                    )
                     and self.activation_config.clamp_limit == 4.0
                 )
             )
@@ -1120,7 +1122,11 @@ class TritonWNA16Experts(TritonExperts):
             elif _LING_IU4_PREFILL_QUANT == "asym_u4":
                 grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_tiled_u4
             elif _LING_IU4_PREFILL_QUANT == "residual2":
-                grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_tiled_r2
+                grouped_operator = (
+                    torch.ops.ling_iu4_decode.grouped_moe_tiled_r2_clamp4
+                    if self.activation_config.clamp_limit == 4.0
+                    else torch.ops.ling_iu4_decode.grouped_moe_tiled_r2
+                )
             elif _LING_IU4_PREFILL_QUANT == "residual3":
                 grouped_operator = (
                     torch.ops.ling_iu4_decode.grouped_moe_tiled_r3_clamp4
