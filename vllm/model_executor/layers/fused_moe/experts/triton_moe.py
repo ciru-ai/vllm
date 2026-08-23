@@ -955,7 +955,13 @@ class TritonWNA16Experts(TritonExperts):
             # MoE layer per scheduler step.  Later layers reuse it, avoiding
             # forty stream synchronizations while replacing the old global-M
             # guess with the step's real routed padding efficiency.
-            if layer_ordinal == 0:
+            # A full tiled checkpoint has no valid W4 fallback, so occupancy
+            # is a scheduling statistic rather than a dispatch veto.  The
+            # gate only chooses between IU4 and canonical W4 when both layouts
+            # are valid (row-major or selective-companion modes).
+            if _LING_IU4_TILED_WEIGHTS:
+                ling_iu4_grouped_eligible = True
+            elif layer_ordinal == 0:
                 post_padded = int(grouped_post_padded.item())
                 route_efficiency = (num_tokens * top_k_num) / max(post_padded, 1)
                 ling_iu4_grouped_eligible = (
