@@ -4,7 +4,6 @@
 import functools
 import gc
 import itertools
-import os
 import threading
 import time
 from collections import defaultdict
@@ -665,47 +664,6 @@ class GPUModelRunner(
                 )
             self.rejection_sampler = RejectionSampler(
                 self.sampler, self.speculative_config, self.device
-            )
-
-        # Ling Kairic Edge is a hybrid proposer: retain the checkpoint's MTP
-        # drafter as the always-synchronized fallback, but prefer an exact
-        # 24-token suffix match only when it supplies a complete 64-token
-        # continuation. The 64-token draft intentionally creates an M65 target
-        # verification batch for the gfx1151 IU4 path.
-        self.ling_kairic_ngram = None
-        self.ling_kairic_ngram_hits = 0
-        self.ling_kairic_ngram_misses = 0
-        self.ling_kairic_prev_was_ngram = False
-        self.ling_kairic_low_accept_streak = 0
-        self.ling_kairic_ngram_cooldown = 0
-        self.ling_kairic_consecutive_hits = 0
-        self.ling_kairic_active_req_id = None
-        self.ling_kairic_burst_resets = 0
-        self.ling_kairic_disabled_for_req = False
-        self.ling_ngram_loop_breaker = (
-            os.getenv("LING_NGRAM_LOOP_BREAKER", "0") == "1"
-        )
-        self.ling_ngram_loop_breaks = 0
-        if self.ling_ngram_loop_breaker:
-            logger.info(
-                "Ling ngram loop breaker enabled: escape low-diversity token cycles"
-            )
-        if (
-            os.getenv("VLLM_LING_KAIRIC_EDGE", "0") == "1"
-            and self.speculative_config is not None
-            and self.speculative_config.method == "mtp"
-        ):
-            from vllm.v1.spec_decode.ngram_proposer import NgramProposer
-
-            self.ling_kairic_ngram = NgramProposer(
-                self.vllm_config,
-                min_n=24,
-                max_n=24,
-                num_draft_tokens=64,
-            )
-            logger.info(
-                "Ling Kairic Edge hybrid enabled: exact ngram 24->64, "
-                "MTP K1 fallback"
             )
 
         self.num_spec_tokens = 0
@@ -1608,11 +1566,8 @@ class GPUModelRunner(
                     self.input_batch.num_computed_tokens_cpu[cur_req_index] -= (
                         correction
                     )
-                    if correction > 0 and (
-                        is_ngram_gpu or self.ling_kairic_ngram is not None
-                    ):
-                        self.input_batch.num_tokens_no_spec[cur_req_index] -= correction
                     if is_ngram_gpu and correction > 0:
+                        self.input_batch.num_tokens_no_spec[cur_req_index] -= correction
                         self.num_tokens_no_spec_gpu[cur_req_index] -= correction
 
             return correct_spec_decode_token_counts
@@ -1632,34 +1587,6 @@ class GPUModelRunner(
         """
         if not self.speculative_config or not self.model_config.is_hybrid:
             return
-
-        # Kairic's modified ngram policy resets after three consecutive
-        # low-acceptance rounds. With request-local history there is no global
-        # map to clear, so temporarily suppress lookups while MTP advances the
-        # sequence beyond the self-match. This prevents low-value copy loops.
-        if self.ling_kairic_ngram is not None and self.ling_kairic_prev_was_ngram:
-            assert output_token_ids.size(0) == 1
-            num_valid = int((output_token_ids[0] != -1).sum().item())
-            accepted_drafts = max(0, num_valid - 1)
-            if accepted_drafts < 32:
-                self.ling_kairic_low_accept_streak += 1
-            else:
-                self.ling_kairic_low_accept_streak = 0
-            if self.ling_kairic_low_accept_streak >= 3:
-                self.ling_kairic_burst_resets += 1
-                self.ling_kairic_disabled_for_req = (
-                    self.ling_kairic_burst_resets >= 2
-                )
-                self.ling_kairic_ngram_cooldown = (
-                    0 if self.ling_kairic_disabled_for_req else 64
-                )
-                self.ling_kairic_low_accept_streak = 0
-                logger.info(
-                    "LING_KAIRIC_NGRAM reset: three low-acceptance rounds; "
-                    "disabled_for_request=%s",
-                    self.ling_kairic_disabled_for_req,
-                )
-            self.ling_kairic_prev_was_ngram = False
 
         # Count the number of accepted tokens for each sequence.
         # Valid tokens are contiguous from position 0, so counting non-(-1)
@@ -3780,7 +3707,6 @@ class GPUModelRunner(
         # Update output token ids with tokens sampled in last step
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
-        logits = self._ling_break_low_diversity_cycle(logits)
         if spec_decode_metadata is None:
             return self.sampler(
                 logits=logits,
@@ -3801,45 +3727,6 @@ class GPUModelRunner(
             sampling_metadata,
         )
         return sampler_output
-
-    def _ling_break_low_diversity_cycle(
-        self, logits: torch.Tensor | None
-    ) -> torch.Tensor | None:
-        if (
-            not self.ling_ngram_loop_breaker
-            or self.speculative_config is not None
-            or logits is None
-        ):
-            return logits
-
-        for req_idx, req_id in enumerate(self.input_batch.req_ids):
-            history = self.requests[req_id].output_token_ids
-            if len(history) < 32:
-                continue
-            window = history[-64:]
-            recent_tokens = set(window)
-            if len(recent_tokens) > 12:
-                continue
-            fourgram_counts: dict[tuple[int, ...], int] = defaultdict(int)
-            for start in range(len(window) - 3):
-                fourgram_counts[tuple(window[start : start + 4])] += 1
-            max_repeats = max(fourgram_counts.values(), default=0)
-            if max_repeats < 8:
-                continue
-            # Forbid only the tiny cycling vocabulary for this one step. The
-            # next sampling step is unconstrained unless the model falls back
-            # into another low-diversity cycle. This is not an output cap.
-            logits[req_idx, list(recent_tokens)] = float("-inf")
-            self.ling_ngram_loop_breaks += 1
-            logger.info(
-                "LING_NGRAM_LOOP_BREAK count=%d req=%s unique=%d "
-                "max_fourgram_repeats=%d",
-                self.ling_ngram_loop_breaks,
-                req_id,
-                len(recent_tokens),
-                max_repeats,
-            )
-        return logits
 
     def _bookkeeping_sync(
         self,
@@ -5367,14 +5254,8 @@ class GPUModelRunner(
             else:
                 mm_embed_inputs = None
 
-            # Keep Ling's single MTP layer synchronized on every iteration,
-            # including iterations where its proposal is replaced by a full
-            # ngram draft. Never recursively run that layer 64 times.
-            mtp_num_spec_tokens = (
-                1 if self.ling_kairic_ngram is not None else num_spec_tokens_to_schedule
-            )
             draft_token_ids = self.drafter.propose(
-                num_speculative_tokens=mtp_num_spec_tokens,
+                num_speculative_tokens=num_spec_tokens_to_schedule,
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
@@ -5386,69 +5267,7 @@ class GPUModelRunner(
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
             )
-            used_ling_kairic_ngram = False
-            if self.ling_kairic_ngram is not None:
-                if not isinstance(sampled_token_ids, list):
-                    raise RuntimeError(
-                        "Ling Kairic Edge requires "
-                        "disable_padded_drafter_batch=true"
-                    )
-                active_req_id = self.input_batch.req_ids[0]
-                if active_req_id != self.ling_kairic_active_req_id:
-                    self.ling_kairic_active_req_id = active_req_id
-                    self.ling_kairic_low_accept_streak = 0
-                    self.ling_kairic_ngram_cooldown = 0
-                    self.ling_kairic_consecutive_hits = 0
-                    self.ling_kairic_burst_resets = 0
-                    self.ling_kairic_disabled_for_req = False
-                if self.ling_kairic_disabled_for_req:
-                    ngram_draft = [[]]
-                elif self.ling_kairic_ngram_cooldown > 0:
-                    self.ling_kairic_ngram_cooldown -= 1
-                    self.ling_kairic_consecutive_hits = 0
-                    ngram_draft = [[]]
-                else:
-                    ngram_draft = self.ling_kairic_ngram.propose(
-                        min(64, num_spec_tokens_to_schedule),
-                        sampled_token_ids,
-                        self.input_batch.num_tokens_no_spec,
-                        self.input_batch.token_ids_cpu,
-                        slot_mappings=slot_mappings,
-                    )
-                # The modified policy is all-or-nothing: short continuations
-                # do not displace the MTP fallback.
-                if len(ngram_draft) == 1 and len(ngram_draft[0]) == 64:
-                    draft_token_ids = ngram_draft
-                    used_ling_kairic_ngram = True
-                    self.ling_kairic_prev_was_ngram = True
-                    self.ling_kairic_consecutive_hits += 1
-                    if self.ling_kairic_consecutive_hits >= 8:
-                        self.ling_kairic_burst_resets += 1
-                        self.ling_kairic_disabled_for_req = (
-                            self.ling_kairic_burst_resets >= 2
-                        )
-                        self.ling_kairic_ngram_cooldown = (
-                            0 if self.ling_kairic_disabled_for_req else 64
-                        )
-                        self.ling_kairic_consecutive_hits = 0
-                        logger.info(
-                            "LING_KAIRIC_NGRAM burst limit reached; "
-                            "disabled_for_request=%s",
-                            self.ling_kairic_disabled_for_req,
-                        )
-                    self.ling_kairic_ngram_hits += 1
-                    logger.info(
-                        "LING_KAIRIC_NGRAM hit=%d miss=%d draft=64",
-                        self.ling_kairic_ngram_hits,
-                        self.ling_kairic_ngram_misses,
-                    )
-                else:
-                    self.ling_kairic_ngram_misses += 1
-                    self.ling_kairic_consecutive_hits = 0
-            if (
-                not used_ling_kairic_ngram
-                and hasattr(self.drafter, "take_last_draft_probs")
-            ):
+            if hasattr(self.drafter, "take_last_draft_probs"):
                 draft_probs = self.drafter.take_last_draft_probs()
                 if draft_probs is not None:
                     self._draft_probs = draft_probs

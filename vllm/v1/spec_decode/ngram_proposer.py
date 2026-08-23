@@ -10,34 +10,19 @@ from vllm.config import VllmConfig
 
 
 class NgramProposer:
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        *,
-        min_n: int | None = None,
-        max_n: int | None = None,
-        num_draft_tokens: int | None = None,
-    ):
+    def __init__(self, vllm_config: VllmConfig):
         assert vllm_config.speculative_config is not None
-        if min_n is None:
-            assert vllm_config.speculative_config.prompt_lookup_min is not None
-            min_n = vllm_config.speculative_config.prompt_lookup_min
-        if max_n is None:
-            assert vllm_config.speculative_config.prompt_lookup_max is not None
-            max_n = vllm_config.speculative_config.prompt_lookup_max
+        assert vllm_config.speculative_config.prompt_lookup_min is not None
+        assert vllm_config.speculative_config.prompt_lookup_max is not None
 
         # Minimum length of the n-gram to match.
-        self.min_n = min_n
+        self.min_n = vllm_config.speculative_config.prompt_lookup_min
         # Maximum length of the n-gram to match.
-        self.max_n = max_n
+        self.max_n = vllm_config.speculative_config.prompt_lookup_max
         # Number of tokens follow the match. If there are less than k
         # tokens follow the match, we will return the maximum amount of
         # tokens until the end.
-        self.k = (
-            num_draft_tokens
-            if num_draft_tokens is not None
-            else vllm_config.speculative_config.num_speculative_tokens
-        )
+        self.k = vllm_config.speculative_config.num_speculative_tokens
         # Maximum length of the model.
         self.max_model_len = vllm_config.model_config.max_model_len
 
