@@ -929,21 +929,10 @@ class TritonWNA16Experts(TritonExperts):
                 "asym_u4", "residual2", "residual3", "residual4"
             )
         )
-        ling_iu4_tiled_companion = None
-        companion_mode = bool(
-            os.environ.get("VLLM_LING_IU4_COMPANION_LAYERS", "")
-        )
-        if ling_iu4_common_eligible and companion_mode:
-            from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
-                get_ling_iu4_tiled_companion,
-            )
-
-            ling_iu4_tiled_companion = get_ling_iu4_tiled_companion(w1.data_ptr())
         ling_iu4_grouped_candidate = (
             ling_iu4_common_eligible
             and _LING_IU4_DECODE_MODE in ("grouped", "grouped_tiled")
             and num_tokens >= 1
-            and (not companion_mode or ling_iu4_tiled_companion is not None)
         )
         grouped_token_ids = grouped_expert_ids = grouped_post_padded = None
         ling_iu4_grouped_eligible = ling_iu4_grouped_candidate
@@ -1060,7 +1049,13 @@ class TritonWNA16Experts(TritonExperts):
             assert grouped_post_padded is not None
             operator_w1, operator_w2 = w1, w2
             operator_w1_scale, operator_w2_scale = self.w1_scale, self.w2_scale
-            tiled_companion = ling_iu4_tiled_companion
+            tiled_companion = None
+            if os.environ.get("VLLM_LING_IU4_COMPANION_LAYERS", ""):
+                from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+                    get_ling_iu4_tiled_companion,
+                )
+
+                tiled_companion = get_ling_iu4_tiled_companion(w1.data_ptr())
             if tiled_companion is not None:
                 grouped_operator = (
                     torch.ops.ling_iu4_decode.grouped_moe_tiled_g16
