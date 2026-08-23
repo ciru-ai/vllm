@@ -74,6 +74,11 @@ _LING_IU4_W13_CODEBOOK = os.environ.get("LING_IU4_W13_CODEBOOK", "s4")
 _LING_IU4_MIN_TOKENS = int(os.environ.get("VLLM_LING_IU4_MIN_TOKENS", "1"))
 if _LING_IU4_MIN_TOKENS < 1:
     raise ValueError("VLLM_LING_IU4_MIN_TOKENS must be at least 1")
+_LING_IU4_MIN_ROUTE_EFFICIENCY = float(
+    os.environ.get("VLLM_LING_IU4_MIN_ROUTE_EFFICIENCY", "0.5")
+)
+if not 0.0 < _LING_IU4_MIN_ROUTE_EFFICIENCY <= 1.0:
+    raise ValueError("VLLM_LING_IU4_MIN_ROUTE_EFFICIENCY must be in (0,1]")
 _LING_IU4_LAYER_WINDOW_TEXT = os.environ.get("VLLM_LING_IU4_LAYER_WINDOW", "")
 if _LING_IU4_LAYER_WINDOW_TEXT:
     _window_parts = _LING_IU4_LAYER_WINDOW_TEXT.split(":", 1)
@@ -103,6 +108,7 @@ if _LING_IU4_DIRECT_OUT and _LING_IU4_DECODE_MODE != "grouped_tiled":
     raise ValueError("VLLM_LING_IU4_DIRECT_OUT=1 requires grouped_tiled mode")
 _LING_IU4_WEIGHT_ORDINALS: dict[int, int] = {}
 _LING_IU4_LOGGED_ORDINALS: set[int] = set()
+_LING_IU4_STEP_ROUTE_DECISION: dict[str, int | float | bool] = {}
 _LING_W2_CAPTURE_DIR = os.environ.get("LING_W2_CAPTURE_DIR", "")
 _LING_W2_CAPTURE_ORDINALS: dict[int, int] = {}
 _LING_W2_CAPTURED_ORDINALS: set[int] = set()
@@ -849,17 +855,18 @@ class TritonWNA16Experts(TritonExperts):
 
         ling_iu4_layer_selected = True
         layer_ordinal = None
-        if _LING_IU4_DECODE_ENABLED and _LING_IU4_LAYER_WINDOW is not None:
+        if _LING_IU4_DECODE_ENABLED:
             weight_key = w1.data_ptr()
             layer_ordinal = _LING_IU4_WEIGHT_ORDINALS.get(weight_key)
             if layer_ordinal is None:
                 layer_ordinal = len(_LING_IU4_WEIGHT_ORDINALS)
                 _LING_IU4_WEIGHT_ORDINALS[weight_key] = layer_ordinal
-            ling_iu4_layer_selected = (
-                _LING_IU4_LAYER_WINDOW[0]
-                <= layer_ordinal
-                < _LING_IU4_LAYER_WINDOW[1]
-            )
+            if _LING_IU4_LAYER_WINDOW is not None:
+                ling_iu4_layer_selected = (
+                    _LING_IU4_LAYER_WINDOW[0]
+                    <= layer_ordinal
+                    < _LING_IU4_LAYER_WINDOW[1]
+                )
             if (
                 ling_iu4_layer_selected
                 and layer_ordinal not in _LING_IU4_LOGGED_ORDINALS
@@ -922,11 +929,47 @@ class TritonWNA16Experts(TritonExperts):
                 "asym_u4", "residual2", "residual3", "residual4"
             )
         )
-        ling_iu4_grouped_eligible = (
+        ling_iu4_grouped_candidate = (
             ling_iu4_common_eligible
             and _LING_IU4_DECODE_MODE in ("grouped", "grouped_tiled")
             and num_tokens >= 1
         )
+        grouped_token_ids = grouped_expert_ids = grouped_post_padded = None
+        ling_iu4_grouped_eligible = ling_iu4_grouped_candidate
+        if ling_iu4_grouped_candidate:
+            grouped_token_ids, grouped_expert_ids, grouped_post_padded = (
+                moe_align_block_size(topk_ids, 16, global_num_experts, expert_map)
+            )
+            # One exact device-to-host occupancy decision at the first routed
+            # MoE layer per scheduler step.  Later layers reuse it, avoiding
+            # forty stream synchronizations while replacing the old global-M
+            # guess with the step's real routed padding efficiency.
+            if layer_ordinal == 0:
+                post_padded = int(grouped_post_padded.item())
+                route_efficiency = (num_tokens * top_k_num) / max(post_padded, 1)
+                ling_iu4_grouped_eligible = (
+                    route_efficiency >= _LING_IU4_MIN_ROUTE_EFFICIENCY
+                )
+                _LING_IU4_STEP_ROUTE_DECISION.update(
+                    num_tokens=num_tokens,
+                    post_padded=post_padded,
+                    route_efficiency=route_efficiency,
+                    eligible=ling_iu4_grouped_eligible,
+                )
+                logger.warning(
+                    "LING_IU4 route gate M=%d postpad=%d efficiency=%.4f "
+                    "eligible=%s",
+                    num_tokens,
+                    post_padded,
+                    route_efficiency,
+                    ling_iu4_grouped_eligible,
+                )
+            else:
+                ling_iu4_grouped_eligible = bool(
+                    _LING_IU4_STEP_ROUTE_DECISION.get("eligible", False)
+                    and _LING_IU4_STEP_ROUTE_DECISION.get("num_tokens")
+                    == num_tokens
+                )
         if _LING_IU4_TILED_WEIGHTS and not ling_iu4_grouped_eligible:
             raise RuntimeError(
                 "tiled IU4 weights cannot fall through to the row-major W4 kernel"
@@ -1001,9 +1044,9 @@ class TritonWNA16Experts(TritonExperts):
             raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
 
         if ling_iu4_grouped_eligible:
-            grouped_token_ids, grouped_expert_ids, grouped_post_padded = (
-                moe_align_block_size(topk_ids, 16, global_num_experts, expert_map)
-            )
+            assert grouped_token_ids is not None
+            assert grouped_expert_ids is not None
+            assert grouped_post_padded is not None
             if _LING_IU4_DECODE_MODE != "grouped_tiled":
                 if _LING_IU4_PREFILL_QUANT == "residual2":
                     grouped_operator = torch.ops.ling_iu4_decode.grouped_moe_r2
