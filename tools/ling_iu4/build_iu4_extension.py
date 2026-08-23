@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 
 import torch
 from torch.utils.cpp_extension import load
@@ -28,7 +29,15 @@ def main() -> None:
 
     build_dir = args.build_dir.resolve()
     build_dir.mkdir(parents=True, exist_ok=True)
-    sources = [tool_dir / "ling_s4s4_op.cu", tool_dir / "ling_decode_iu4_op.cu"]
+    source_files = [
+        tool_dir / "ling_s4s4_op.cu",
+        tool_dir / "ling_decode_iu4_op.cu",
+    ]
+    sources = []
+    for source in source_files:
+        staged = build_dir / source.name
+        shutil.copy2(source, staged)
+        sources.append(staged)
     library = load(
         name="ling_decode_iu4_ext",
         sources=[str(path) for path in sources],
@@ -50,7 +59,7 @@ def main() -> None:
     manifest = {
         "library": str(output),
         "library_sha256": sha256(output),
-        "sources": {path.name: sha256(path) for path in sources},
+        "sources": {path.name: sha256(path) for path in source_files},
         "torch_version": torch.__version__,
         "torch_hip": torch.version.hip,
     }

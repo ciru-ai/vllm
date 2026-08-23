@@ -23,26 +23,8 @@ export PATH="$HOME/.local/bin:$PATH"
 git clone --branch ciru/ling3-gfx1151-iu4 \
   https://github.com/ciru-ai/vllm.git "$HOME/vllm-ling-ciru-iu4"
 cd "$HOME/vllm-ling-ciru-iu4"
-
-uv venv --python 3.12 .venv
+bash tools/ling_iu4/install_runtime.sh
 source .venv/bin/activate
-uv pip install --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ \
-  'torch[device-gfx1151]==2.13.0+rocm7.15.0a20260728' \
-  'torchvision[device-gfx1151]==0.28.0+rocm7.15.0a20260728' \
-  'torchaudio==2.11.0.2+rocm7.15.0a20260728' \
-  'triton==3.8.0+git4cff872c.rocm7.15.0a20260728' \
-  'rocm[libraries,devel,device-gfx1151]==7.15.0a20260728'
-rocm-sdk init
-rocm-sdk test
-
-uv pip install 'cmake>=3.26.1,<4' ninja packaging wheel setuptools setuptools-scm setuptools-rust jinja2
-uv pip install -r requirements/rocm.txt
-
-export VLLM_TARGET_DEVICE=rocm
-export PYTORCH_ROCM_ARCH=gfx1151
-export MAX_JOBS="${MAX_JOBS:-16}"
-uv pip install --no-build-isolation --no-deps -e .
-python tools/ling_iu4/build_iu4_extension.py
 ```
 
 Download and launch:
