@@ -48,6 +48,18 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
+_LING_IU4_TILED_COMPANIONS: dict[
+    int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]
+] = {}
+_LING_IU4_COMPANION_ORDINAL = 0
+
+
+def get_ling_iu4_tiled_companion(
+    canonical_w13_data_ptr: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int] | None:
+    """Return a load-time IU4 companion without altering canonical W4."""
+    return _LING_IU4_TILED_COMPANIONS.get(canonical_w13_data_ptr)
+
 
 class WNA16MoEBackend(Enum):
     MARLIN = "MARLIN"
@@ -83,6 +95,7 @@ def backend_to_kernel_cls(
     elif backend == WNA16MoEBackend.FLASHINFER_TRTLLM:
         return [TrtLlmMxint4ExpertsMonolithic]
     elif backend == WNA16MoEBackend.TRITON:
+        global _LING_IU4_COMPANION_ORDINAL
         return [TritonWNA16Experts]
     elif backend == WNA16MoEBackend.XPU:
         from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
@@ -1773,6 +1786,61 @@ def convert_to_wna16_moe_kernel_format(
             else:
                 w13_uint8, w13_scale = tile_g32_n32(w13_uint8, w13_scale)
             w2_uint8, w2_scale = tile_g32_n32(w2_uint8, w2_scale)
+        else:
+            companion_layers_text = os.environ.get(
+                "VLLM_LING_IU4_COMPANION_LAYERS", ""
+            )
+            if companion_layers_text:
+                selected_ordinals = {
+                    int(value)
+                    for value in companion_layers_text.split(",")
+                    if value.strip()
+                }
+                ordinal = _LING_IU4_COMPANION_ORDINAL
+                _LING_IU4_COMPANION_ORDINAL += 1
+                if ordinal in selected_ordinals:
+                    def tile_companion_g32_n32(
+                        weight: torch.Tensor, scale: torch.Tensor
+                    ) -> tuple[torch.Tensor, torch.Tensor]:
+                        experts, outputs, packed_bytes = weight.shape
+                        groups = scale.shape[2]
+                        assert outputs % 32 == 0
+                        assert packed_bytes == groups * 16
+                        words = weight.view(torch.int32).view(
+                            experts, outputs // 32, 32, groups, 2, 2
+                        )
+                        tiled_weight = (
+                            words.permute(0, 1, 3, 4, 2, 5)
+                            .contiguous()
+                            .view(torch.uint8)
+                            .view_as(weight)
+                        )
+                        tiled_scale = (
+                            scale.view(experts, outputs // 32, 32, groups)
+                            .permute(0, 1, 3, 2)
+                            .contiguous()
+                            .view_as(scale)
+                        )
+                        return tiled_weight, tiled_scale
+
+                    companion_w13, companion_w13_scale = tile_companion_g32_n32(
+                        w13_uint8, w13_scale
+                    )
+                    companion_w2, companion_w2_scale = tile_companion_g32_n32(
+                        w2_uint8, w2_scale
+                    )
+                    _LING_IU4_TILED_COMPANIONS[w13_uint8.data_ptr()] = (
+                        companion_w13,
+                        companion_w2,
+                        companion_w13_scale,
+                        companion_w2_scale,
+                        ordinal,
+                    )
+                    logger.warning(
+                        "LING_IU4 created tiled companion for routed-MoE "
+                        "ordinal %d; canonical W4 retained",
+                        ordinal,
+                    )
         return (
             w13_uint8,
             w2_uint8,
