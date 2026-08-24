@@ -61,6 +61,10 @@ export VLLM_LING_IU4_TILED_WEIGHTS=1
 export VLLM_LING_IU4_MIN_TOKENS=1
 export VLLM_LING_IU4_LIBRARY="$iu4_library"
 export LING_IU4_PREFILL_QUANT=residual2
+# Use the 8K Ling prefill shape for a single runnable/latched long request and
+# the 16K shape when at least two short/medium prefills are runnable. Set this
+# to 0 to use MAX_NUM_BATCHED_TOKENS as a conventional static budget.
+export VLLM_LING_DYNAMIC_BATCHED_TOKENS="${VLLM_LING_DYNAMIC_BATCHED_TOKENS:-1}"
 
 args=(
   serve "$model_path"

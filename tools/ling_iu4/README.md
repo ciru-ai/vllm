@@ -44,8 +44,19 @@ MODEL_PATH="$HOME/models/Ling-3.0-Flash-CIRU-IU4" \
 ```
 
 The default server listens at `http://127.0.0.1:8000/v1`, enables Ling's native
-MTP K1 verifier, uses six scheduler slots, a 16K batched-token budget, and the
-native 262,144-token context. The validated target is a 128 GB Strix Halo APU.
+MTP K1 verifier, uses six scheduler slots, a 16K upper batched-token budget,
+and the native 262,144-token context. Ling's dynamic scheduler uses the faster
+8K prefill shape for one runnable request or a latched long uncached prompt,
+then uses 16K when two or more short/medium prefills are runnable. Existing
+decode priority is unchanged. The validated target is a 128 GB Strix Halo APU.
+
+To opt out and use a conventional static budget, set both controls explicitly:
+
+```bash
+VLLM_LING_DYNAMIC_BATCHED_TOKENS=0 MAX_NUM_BATCHED_TOKENS=8192 \
+  MODEL_PATH="$HOME/models/Ling-3.0-Flash-CIRU-IU4" \
+  bash tools/ling_iu4/run_ling_ciru_iu4.sh
+```
 
 ## Idle-CPU hotfix for an existing checkout
 
