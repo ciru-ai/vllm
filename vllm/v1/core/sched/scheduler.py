@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -113,6 +114,42 @@ class Scheduler(SchedulerInterface):
             if self.scheduler_config.max_num_scheduled_tokens is not None
             else self.scheduler_config.max_num_batched_tokens
         )
+        # Ling's long single-request prefills prefer the production 8K budget,
+        # while two or more short/medium prefills benefit from a 16K budget.
+        # Keep this opt-in so the existing static max-num-batched-tokens
+        # contract remains an explicit override.
+        dynamic_budget_env = os.getenv(
+            "VLLM_LING_DYNAMIC_BATCHED_TOKENS", "0"
+        ).strip().lower()
+        dynamic_budget_requested = dynamic_budget_env in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        architectures = set(vllm_config.model_config.architectures or [])
+        self.ling_dynamic_batched_tokens = dynamic_budget_requested and (
+            "BailingMoeV3ForCausalLM" in architectures
+        )
+        self.ling_dynamic_low_budget = min(8192, self.max_num_scheduled_tokens)
+        self.ling_dynamic_high_budget = min(16384, self.max_num_scheduled_tokens)
+        self.ling_long_prefill_req_ids: set[str] = set()
+        self.ling_last_dynamic_budget: int | None = None
+        if dynamic_budget_requested and not self.ling_dynamic_batched_tokens:
+            logger.warning(
+                "Ignoring VLLM_LING_DYNAMIC_BATCHED_TOKENS for non-Ling "
+                "architecture(s): %s",
+                sorted(architectures),
+            )
+        elif self.ling_dynamic_batched_tokens:
+            logger.info(
+                "Enabled Ling dynamic batched-token policy (single/long=%d, "
+                "concurrent short/medium=%d). Set "
+                "VLLM_LING_DYNAMIC_BATCHED_TOKENS=0 to retain the static "
+                "--max-num-batched-tokens budget.",
+                self.ling_dynamic_low_budget,
+                self.ling_dynamic_high_budget,
+            )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
@@ -437,6 +474,44 @@ class Scheduler(SchedulerInterface):
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
 
+    def _get_ling_dynamic_token_budget(self) -> int:
+        """Return the per-step Ling token budget without reordering work."""
+        if not self.ling_dynamic_batched_tokens:
+            return self.max_num_scheduled_tokens
+
+        # A latch survives queue transitions and prefill chunks, then clears
+        # as soon as the request's prompt has been fully computed.
+        self.ling_long_prefill_req_ids.intersection_update(
+            request.request_id
+            for request in self.requests.values()
+            if request.num_computed_tokens < request.num_prompt_tokens
+        )
+
+        runnable_count = len(self.running)
+        short_medium_prefills = sum(
+            request.num_computed_tokens < request.num_prompt_tokens
+            and request.num_prompt_tokens - request.num_computed_tokens <= 8192
+            for request in self.running
+        )
+        for queue in (self.waiting, self.skipped_waiting):
+            for request in queue:
+                if self._is_blocked_waiting_status(request.status):
+                    continue
+                runnable_count += 1
+                # Prefix hits are resolved when a waiting request is admitted.
+                # Until then, total prompt length is the conservative uncached
+                # estimate; the exact long-request latch is set after lookup.
+                if request.num_prompt_tokens - request.num_computed_tokens <= 8192:
+                    short_medium_prefills += 1
+
+        if (
+            runnable_count <= 1
+            or self.ling_long_prefill_req_ids
+            or short_medium_prefills < 2
+        ):
+            return self.ling_dynamic_low_budget
+        return self.ling_dynamic_high_budget
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -457,7 +532,13 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
-        token_budget = self.max_num_scheduled_tokens
+        token_budget = self._get_ling_dynamic_token_budget()
+        if (
+            self.ling_dynamic_batched_tokens
+            and token_budget != self.ling_last_dynamic_budget
+        ):
+            logger.info("Ling dynamic scheduler token budget: %d", token_budget)
+            self.ling_last_dynamic_budget = token_budget
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -839,6 +920,26 @@ class Scheduler(SchedulerInterface):
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
                     assert num_computed_tokens <= request.num_tokens
+
+                    if self.ling_dynamic_batched_tokens:
+                        uncached_prompt_tokens = max(
+                            0, request.num_prompt_tokens - num_computed_tokens
+                        )
+                        if uncached_prompt_tokens > 8192:
+                            self.ling_long_prefill_req_ids.add(request_id)
+                            # Running decode work was scheduled first and keeps
+                            # priority. Clamp only the remaining step budget so
+                            # the complete iteration cannot exceed 8K.
+                            scheduled_tokens = sum(num_scheduled_tokens.values())
+                            token_budget = min(
+                                token_budget,
+                                max(
+                                    0,
+                                    self.ling_dynamic_low_budget - scheduled_tokens,
+                                ),
+                            )
+                            if token_budget == 0:
+                                break
 
                     # Skip request with pending mm encoding prefetches
                     if (
