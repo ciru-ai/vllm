@@ -10,6 +10,8 @@ fi
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 python_bin="${PYTHON_BIN:-python}"
 iu4_library="${LING_IU4_LIBRARY:-$repo_root/tools/ling_iu4/build/ling_decode_iu4_ext.so}"
+rocr_override_dir="${ROCR_IDLE_RUNTIME_DIR:-$repo_root/runtime-overrides/rocr-7.15-gcc-idle}"
+rocr_idle_runtime="$rocr_override_dir/libhsa-runtime64.so.1.21.0"
 
 [[ "$(uname -s)" == Linux ]] || {
   echo "The ROCm IU4 runtime requires Linux. Use WSL2/ROCDXG on Windows." >&2
@@ -21,6 +23,25 @@ iu4_library="${LING_IU4_LIBRARY:-$repo_root/tools/ling_iu4/build/ling_decode_iu4
   echo "Build it first with: $python_bin tools/ling_iu4/build_iu4_extension.py" >&2
   exit 2
 }
+case "$rocr_override_dir" in
+  *[[:space:]:]*)
+    echo "ROCR_IDLE_RUNTIME_DIR cannot contain whitespace or ':': $rocr_override_dir" >&2
+    exit 2
+    ;;
+esac
+if [[ "${CIRU_DISABLE_ROCR_IDLE_FIX:-0}" == 1 ]]; then
+  echo "WARNING: CIRU ROCr idle-runtime override is disabled." >&2
+else
+  if [[ ! -r "$rocr_idle_runtime" || ! -r "$rocr_override_dir/SHA256SUMS" ]]; then
+    echo "Verified ROCr idle-runtime override is missing from: $rocr_override_dir" >&2
+    echo "Install it with: bash tools/ling_iu4/install_rocr_idle_fix.sh '$repo_root'" >&2
+    exit 2
+  fi
+  if ! (cd "$rocr_override_dir" && sha256sum --check --status SHA256SUMS); then
+    echo "ROCr idle-runtime checksum verification failed: $rocr_idle_runtime" >&2
+    exit 2
+  fi
+fi
 
 export VLLM_TARGET_DEVICE=rocm
 export VLLM_ROCM_USE_AITER=0
@@ -67,6 +88,10 @@ if [[ "${DRY_RUN:-0}" == 1 ]]; then
   printf '%q ' "$python_bin" -m vllm.entrypoints.cli.main "${args[@]}"
   printf '\n'
   exit 0
+fi
+
+if [[ "${CIRU_DISABLE_ROCR_IDLE_FIX:-0}" != 1 ]]; then
+  export LD_PRELOAD="$rocr_idle_runtime${LD_PRELOAD:+:$LD_PRELOAD}"
 fi
 
 exec "$python_bin" -m vllm.entrypoints.cli.main "${args[@]}"

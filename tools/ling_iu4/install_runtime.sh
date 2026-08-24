@@ -98,7 +98,12 @@ FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE UV_CACHE_DIR="$uv_cache" \
   uv pip install --python "$venv/bin/python" --no-build-isolation --no-deps "$flash_source"
 
 "$venv/bin/python" "$repo_root/tools/ling_iu4/build_iu4_extension.py"
-"$venv/bin/python" - <<'PY'
+bash "$repo_root/tools/ling_iu4/install_rocr_idle_fix.sh" "$repo_root"
+rocr_override_dir="$repo_root/runtime-overrides/rocr-7.15-gcc-idle"
+rocr_idle_runtime="$rocr_override_dir/libhsa-runtime64.so.1.21.0"
+(cd "$rocr_override_dir" && sha256sum --check --status SHA256SUMS)
+LD_PRELOAD="$rocr_idle_runtime${LD_PRELOAD:+:$LD_PRELOAD}" \
+  "$venv/bin/python" - <<'PY'
 import importlib
 import torch
 import triton

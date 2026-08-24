@@ -16,7 +16,8 @@ claimed as a separate clean-host validation.
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential git libnuma-dev ninja-build python3.12 python3.12-dev python3.12-venv
+sudo apt install -y build-essential git libnuma-dev libdrm-dev libelf-dev \
+  ninja-build pkg-config python3.12 python3.12-dev python3.12-venv xxd
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -26,6 +27,11 @@ cd "$HOME/vllm-ling-ciru-iu4"
 bash tools/ling_iu4/install_runtime.sh
 source .venv/bin/activate
 ```
+
+The installer also rebuilds the wheel-pinned ROCr userspace library with the
+host compiler. The distributed ROCm 7.15 wheel can otherwise leave a CPU core
+busy while `gfx1151` is idle. The launcher verifies this local runtime by
+checksum and preloads it automatically.
 
 Download and launch:
 
@@ -40,6 +46,21 @@ MODEL_PATH="$HOME/models/Ling-3.0-Flash-CIRU-IU4" \
 The default server listens at `http://127.0.0.1:8000/v1`, enables Ling's native
 MTP K1 verifier, uses six scheduler slots, a 16K batched-token budget, and the
 native 262,144-token context. The validated target is a 128 GB Strix Halo APU.
+
+## Idle-CPU hotfix for an existing checkout
+
+Update the public branch, build the corrected ROCr runtime once, and restart
+the server:
+
+```bash
+git pull --ff-only
+bash tools/ling_iu4/install_rocr_idle_fix.sh "$PWD"
+```
+
+The hotfix preserves the model, vLLM environment, and IU4 extension. For an
+emergency diagnostic rollback only, launch once with
+`CIRU_DISABLE_ROCR_IDLE_FIX=1`; this restores the wheel runtime and may restore
+the idle CPU spin.
 
 Before building, native Linux must expose `/dev/kfd` and `/dev/dri`; WSL2 users
 must install AMD ROCDXG and expose `/dev/dxg`. Native Windows vLLM is not
