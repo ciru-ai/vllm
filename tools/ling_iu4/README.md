@@ -1,5 +1,8 @@
 # Ling 3.0 Flash CIRU IU4 runtime
 
+**Runtime release: v1.1.0** · [`CHANGELOG.md`](CHANGELOG.md) ·
+[`RELEASE_NOTES_v1.1.0.md`](RELEASE_NOTES_v1.1.0.md)
+
 This directory contains the `gfx1151` extension and production launcher used by
 `jcbtc/Ling-3.0-Flash-CIRU-IU4`. Stock vLLM can load the checkpoint through its
 W4A16 path, but it does not provide the native IU4 prefill results reported on
@@ -21,7 +24,7 @@ sudo apt install -y build-essential git libnuma-dev libdrm-dev libelf-dev \
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 
-git clone --branch ciru/ling3-gfx1151-iu4 \
+git clone --branch ling-iu4-v1.1.0 \
   https://github.com/ciru-ai/vllm.git "$HOME/vllm-ling-ciru-iu4"
 cd "$HOME/vllm-ling-ciru-iu4"
 bash tools/ling_iu4/install_runtime.sh
@@ -45,10 +48,17 @@ MODEL_PATH="$HOME/models/Ling-3.0-Flash-CIRU-IU4" \
 
 The default server listens at `http://127.0.0.1:8000/v1`, enables Ling's native
 MTP K1 verifier, uses six scheduler slots, a 16K upper batched-token budget,
-and the native 262,144-token context. Ling's dynamic scheduler uses the faster
-8K prefill shape for one runnable request or a latched long uncached prompt,
-then uses 16K when two or more short/medium prefills are runnable. Existing
-decode priority is unchanged. The validated target is a 128 GB Strix Halo APU.
+and the native 262,144-token context. Ling's scheduler uses the faster 8K
+prefill shape for one runnable request or a latched long uncached prompt, then
+uses 16K when two or more short/medium prefills are runnable. Decode priority
+is unchanged. The validated target is a 128 GB Strix Halo APU.
+
+In the matched warmed C1/32K release comparison, v1.1 improved prefill by
+31.17% and reduced wall time by 22.15% versus the previous static-16K launcher.
+The matched C6/8K wall result remained within 0.58% of the static path.
+The release notes include every retained dynamic-build row: the C1 2K–128K
+context sweep, warmed C1–C10 4K concurrency ladder, matched scheduler
+boundaries, and the full HermesAgent-20 C6 validation.
 
 To opt out and use a conventional static budget, set both controls explicitly:
 

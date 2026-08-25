@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+runtime_version="$(<"$repo_root/tools/ling_iu4/VERSION")"
+if [[ "${1:-}" == --version ]]; then
+  printf 'CIRU Ling IU4 runtime v%s\n' "$runtime_version"
+  exit 0
+fi
+
 model_path="${MODEL_PATH:-${1:-}}"
 if [[ -z "$model_path" ]]; then
   echo "Set MODEL_PATH or pass the downloaded model directory as argument 1." >&2
   exit 2
 fi
 
-repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 python_bin="${PYTHON_BIN:-python}"
 iu4_library="${LING_IU4_LIBRARY:-$repo_root/tools/ling_iu4/build/ling_decode_iu4_ext.so}"
 rocr_override_dir="${ROCR_IDLE_RUNTIME_DIR:-$repo_root/runtime-overrides/rocr-7.15-gcc-idle}"
@@ -61,6 +67,7 @@ export VLLM_LING_IU4_TILED_WEIGHTS=1
 export VLLM_LING_IU4_MIN_TOKENS=1
 export VLLM_LING_IU4_LIBRARY="$iu4_library"
 export LING_IU4_PREFILL_QUANT=residual2
+export CIRU_LING_IU4_RUNTIME_VERSION="$runtime_version"
 # Use the 8K Ling prefill shape for a single runnable/latched long request and
 # the 16K shape when at least two short/medium prefills are runnable. Set this
 # to 0 to use MAX_NUM_BATCHED_TOKENS as a conventional static budget.
