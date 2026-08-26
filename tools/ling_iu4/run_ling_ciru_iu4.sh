@@ -103,6 +103,8 @@ fi
 
 if [[ "${CIRU_DISABLE_ROCR_IDLE_FIX:-0}" != 1 ]]; then
   export LD_PRELOAD="$rocr_idle_runtime${LD_PRELOAD:+:$LD_PRELOAD}"
+  export VLLM_LING_ROCR_IDLE_RUNTIME_PATH="$rocr_idle_runtime"
+  printf 'CIRU ROCr idle fix: verified and active (%s)\n' "$rocr_idle_runtime"
 fi
 
 exec "$python_bin" -m vllm.entrypoints.cli.main "${args[@]}"

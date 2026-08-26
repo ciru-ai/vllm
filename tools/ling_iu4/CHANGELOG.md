@@ -1,5 +1,13 @@
 # CIRU Ling IU4 runtime changelog
 
+## 1.1.1 — 2026-08-25
+
+- Activates the corrected ROCr library inside the private runtime environment and installs an early-preload bootstrap, so direct `vllm serve` and `python -m vllm` launches cannot silently bypass the idle-CPU correction.
+- Preserves the original wheel runtime beside the activated file for recovery without modifying shared uv caches or other environments.
+- Adds an explicit launcher activation banner and an idle-runtime verifier that checks the library mapped by EngineCore and measures instantaneous per-thread CPU.
+- Adds `VENV` support to the existing-checkout hotfix command.
+- Keeps model weights, scheduler behavior, kernels, MTP, and benchmarked performance paths unchanged from v1.1.0.
+
 ## 1.1.0 — 2026-08-24
 
 - Added the Ling-only dynamic batched-token scheduler.

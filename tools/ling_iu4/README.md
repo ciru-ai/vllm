@@ -1,7 +1,7 @@
 # Ling 3.0 Flash CIRU IU4 runtime
 
-**Runtime release: v1.1.0** · [`CHANGELOG.md`](CHANGELOG.md) ·
-[`RELEASE_NOTES_v1.1.0.md`](RELEASE_NOTES_v1.1.0.md)
+**Runtime release: v1.1.1** · [`CHANGELOG.md`](CHANGELOG.md) ·
+[`RELEASE_NOTES_v1.1.1.md`](RELEASE_NOTES_v1.1.1.md)
 
 This directory contains the `gfx1151` extension and production launcher used by
 `jcbtc/Ling-3.0-Flash-CIRU-IU4`. Stock vLLM can load the checkpoint through its
@@ -24,7 +24,7 @@ sudo apt install -y build-essential git libnuma-dev libdrm-dev libelf-dev \
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 
-git clone --branch ling-iu4-v1.1.0 \
+git clone --branch ling-iu4-v1.1.1 \
   https://github.com/ciru-ai/vllm.git "$HOME/vllm-ling-ciru-iu4"
 cd "$HOME/vllm-ling-ciru-iu4"
 bash tools/ling_iu4/install_runtime.sh
@@ -33,8 +33,10 @@ source .venv/bin/activate
 
 The installer also rebuilds the wheel-pinned ROCr userspace library with the
 host compiler. The distributed ROCm 7.15 wheel can otherwise leave a CPU core
-busy while `gfx1151` is idle. The launcher verifies this local runtime by
-checksum and preloads it automatically.
+busy while `gfx1151` is idle. v1.1.1 activates the corrected library inside the
+private environment and installs an early-preload bootstrap; the launcher also
+independently verifies and preloads it. This protects the supported launcher,
+direct `vllm serve`, and `python -m vllm` starts.
 
 Download and launch:
 
@@ -78,10 +80,20 @@ git pull --ff-only
 bash tools/ling_iu4/install_rocr_idle_fix.sh "$PWD"
 ```
 
-The hotfix preserves the model, vLLM environment, and IU4 extension. For an
-emergency diagnostic rollback only, launch once with
-`CIRU_DISABLE_ROCR_IDLE_FIX=1`; this restores the wheel runtime and may restore
-the idle CPU spin.
+If the checkout uses a non-default environment, pass it explicitly:
+
+```bash
+VENV=/path/to/venv bash tools/ling_iu4/install_rocr_idle_fix.sh "$PWD"
+```
+
+The hotfix preserves the model and IU4 extension. It stores the original wheel
+runtime beside the activated file without changing shared package caches or
+other environments. After restarting and leaving the server idle, verify the
+live EngineCore mapping and instantaneous CPU sample:
+
+```bash
+bash tools/ling_iu4/verify_rocr_idle_fix.sh
+```
 
 Before building, native Linux must expose `/dev/kfd` and `/dev/dri`; WSL2 users
 must install AMD ROCDXG and expose `/dev/dxg`. Native Windows vLLM is not

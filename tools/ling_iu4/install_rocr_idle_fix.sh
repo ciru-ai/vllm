@@ -64,13 +64,63 @@ case "$repo_root" in
     die "repository root cannot contain whitespace or ':' because ROCr is loaded through LD_PRELOAD: $repo_root"
     ;;
 esac
-venv="$repo_root/.venv"
+venv="$(absolute_path "${VENV:-$repo_root/.venv}")"
 source_root="$(absolute_path "${CIRU_ROCR_SOURCE_DIR:-$repo_root/.deps/rocr-idle-fix/source}")"
 build_dir="$(absolute_path "${CIRU_ROCR_BUILD_DIR:-$repo_root/.deps/rocr-idle-fix/build}")"
 override_dir="$repo_root/runtime-overrides/rocr-7.15-gcc-idle"
 runtime_name=libhsa-runtime64.so.1.21.0
 runtime_path="$override_dir/$runtime_name"
 provenance="$override_dir/BUILD-PROVENANCE.txt"
+
+activate_runtime_environment() {
+  local site packaged_runtime packaged_hash backup_path expected_hash active_hash
+  site="$("$venv/bin/python" - <<'PY'
+import site
+print(site.getsitepackages()[0])
+PY
+)"
+  packaged_runtime="$site/_rocm_sdk_core/lib/libhsa-runtime64.so.1"
+  [ -r "$packaged_runtime" ] || \
+    die "wheel-packaged ROCr runtime is missing: $packaged_runtime"
+
+  expected_hash="$(sha256sum "$runtime_path" | awk '{print $1}')"
+  active_hash="$(sha256sum "$packaged_runtime" | awk '{print $1}')"
+  if [ "$active_hash" = "$expected_hash" ]; then
+    printf 'ROCr idle-runtime is already active inside %s\n' "$venv"
+    install -m 0644 \
+      "$repo_root/tools/ling_iu4/ciru_rocr_preload.py" \
+      "$site/_ciru_rocr_preload.py"
+    install -m 0644 \
+      "$repo_root/tools/ling_iu4/ciru_rocr_preload.pth" \
+      "$site/ciru_rocr_preload.pth"
+    printf 'ROCr early-preload bootstrap installed inside %s\n' "$venv"
+    return 0
+  fi
+
+  # Keep the package-owned binary recoverable, but replace its directory entry
+  # so hard-linked uv caches and other environments remain untouched. This
+  # makes direct `vllm serve` launches safe instead of relying only on the CIRU
+  # launcher's LD_PRELOAD environment.
+  packaged_hash="$active_hash"
+  backup_path="$packaged_runtime.ciru-original-$packaged_hash"
+  if [ ! -e "$backup_path" ]; then
+    cp -p -- "$packaged_runtime" "$backup_path"
+  fi
+  install -m 0755 "$runtime_path" "$packaged_runtime.new"
+  mv -f -- "$packaged_runtime.new" "$packaged_runtime"
+  active_hash="$(sha256sum "$packaged_runtime" | awk '{print $1}')"
+  [ "$active_hash" = "$expected_hash" ] || \
+    die "activated ROCr runtime checksum mismatch: $packaged_runtime"
+  install -m 0644 \
+    "$repo_root/tools/ling_iu4/ciru_rocr_preload.py" \
+    "$site/_ciru_rocr_preload.py"
+  install -m 0644 \
+    "$repo_root/tools/ling_iu4/ciru_rocr_preload.pth" \
+    "$site/ciru_rocr_preload.pth"
+  printf 'ROCr idle-runtime activated inside %s\n' "$venv"
+  printf 'ROCr early-preload bootstrap installed inside %s\n' "$venv"
+  printf 'Original wheel runtime preserved at: %s\n' "$backup_path"
+}
 
 if [ "$(uname -s)" != Linux ]; then
   die 'the ROCr idle-runtime build requires Linux'
@@ -83,6 +133,7 @@ if [ "$force" != --force ] && [ -r "$runtime_path" ] && \
    (cd "$override_dir" && sha256sum --check --status SHA256SUMS); then
   printf 'ROCr idle-runtime override is already installed and verified: %s\n' \
     "$runtime_path"
+  activate_runtime_environment
   exit 0
 fi
 
@@ -245,6 +296,7 @@ mv -f "$runtime_path.new" "$runtime_path"
   printf 'cxx=%s\n' "$("$cxx" --version | head -n 1)"
 } >"$provenance"
 (cd "$override_dir" && sha256sum --check SHA256SUMS)
+activate_runtime_environment
 
 printf 'ROCr idle-runtime override installed: %s\n' "$runtime_path"
-printf 'The CIRU Ling IU4 launcher verifies and preloads it automatically.\n'
+printf 'Direct vLLM launches and the CIRU launcher now use the corrected runtime.\n'
