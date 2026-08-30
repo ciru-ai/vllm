@@ -15,6 +15,10 @@ from vllm.models.glm5next.nvidia.model import (
     Glm5NextModel,
 )
 from vllm.models.glm5next.nvidia.mtp import Glm5NextMTP
+from vllm.v1.attention.backends.mla import indexer as mla_indexer
+from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
+    ROCMAiterMLASparseBackend,
+)
 
 
 def _bare_model(hidden_size: int, layer) -> Glm5NextModel:
@@ -61,6 +65,15 @@ def test_glm5next_pp_classes_are_discoverable():
     assert supports_pp(Glm5NextForCausalLM)
     assert supports_pp(Glm5NextForConditionalGeneration)
     assert supports_pp(Glm5NextMTP)
+
+
+def test_rocm_sparse_backends_pin_exact_64_token_pages(monkeypatch):
+    monkeypatch.setattr(mla_indexer.current_platform, "is_rocm", lambda: True)
+    assert (
+        mla_indexer.DeepseekV32IndexerBackend.get_supported_kernel_block_sizes()
+        == [1, 64]
+    )
+    assert ROCMAiterMLASparseBackend.get_supported_kernel_block_sizes() == [1, 64]
 
 
 def test_glm5next_pp_factory_uses_native_four_stream_shape():
