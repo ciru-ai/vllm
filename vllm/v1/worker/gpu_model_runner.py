@@ -701,6 +701,12 @@ class GPUModelRunner(
                     "Unknown speculative decoding method: "
                     f"{self.speculative_config.method}"
                 )
+
+        # external_launcher PP broadcasts the last rank's logits to every rank,
+        # and every rank runs sample_tokens() against its local scheduler state.
+        # Keep the heavyweight drafter on the last rank, but give each rank the
+        # lightweight verifier used by _sample().
+        if self.speculative_config:
             self.rejection_sampler = RejectionSampler(
                 self.sampler, self.speculative_config, self.device
             )
