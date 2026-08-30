@@ -4976,6 +4976,18 @@ class GPUModelRunner(
                 src=pp.world_size - 1,
             )
             assert relayed is None or isinstance(relayed, DraftTokenIds)
+            if relayed is not None and not pp.is_last_rank:
+                # External-launcher engines create independent request IDs on
+                # each rank. Their persistent batches remain row-aligned, so
+                # attach the relayed draft rows to this scheduler's local IDs.
+                local_req_ids = self.input_batch.req_ids.copy()
+                if len(local_req_ids) != len(relayed.draft_token_ids):
+                    raise RuntimeError(
+                        "PP draft relay row mismatch: "
+                        f"local={len(local_req_ids)}, "
+                        f"remote={len(relayed.draft_token_ids)}"
+                    )
+                relayed = DraftTokenIds(local_req_ids, relayed.draft_token_ids)
             return relayed
 
         return output
