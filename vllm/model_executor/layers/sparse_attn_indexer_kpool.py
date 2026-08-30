@@ -1078,7 +1078,13 @@ class SparseAttnIndexerKpool(CustomOp):
         assert isinstance(q_quant, torch.Tensor), (
             "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
-        if rocm_aiter_ops.is_enabled():
+        from vllm.platforms.rocm import on_gfx11
+
+        if (
+            rocm_aiter_ops.is_enabled()
+            or rocm_aiter_ops.is_rdna_aiter_enabled()
+            or on_gfx11()
+        ):
             if index_kpool <= 1:
                 return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
                     hidden_states,
