@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+from copy import copy
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, cast
 
@@ -42,7 +43,11 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
-from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import (
     empty_exponential_noise_like,
@@ -154,6 +159,9 @@ class SpecDecodeBaseProposer:
 
         self.draft_attn_groups: list[AttentionGroup] = []
         self.kv_cache_gid: int = -1
+        self._per_group_block_tables: dict[int, torch.Tensor] = {}
+        self._per_group_slot_mappings: dict[int, torch.Tensor] = {}
+        self._per_group_slot_mapping_buffers: dict[int, torch.Tensor] = {}
         self.eagle3_use_aux_hidden_state: bool = (
             self._get_eagle3_use_aux_hidden_state_from_config()
         )
@@ -403,18 +411,39 @@ class SpecDecodeBaseProposer:
         num_tokens: int,
         slot_mapping: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Return slot_mapping dict for EAGLE layers.
+        """Return each draft layer's slot mapping from its own cache group."""
+        per_layer: dict[str, torch.Tensor] = {}
+        for attn_group in self.draft_attn_groups:
+            gid = attn_group.kv_cache_group_id
+            buf = self._slot_mapping_buffer_for(gid)
+            source = self._per_group_slot_mappings.get(gid, slot_mapping)
+            if source is not None and buf.data_ptr() != source.data_ptr():
+                num_actual = source.shape[0]
+                buf[:num_actual].copy_(source)
+                if num_tokens > num_actual:
+                    buf[num_actual:num_tokens].fill_(PADDING_SLOT_ID)
+            view = buf[:num_tokens]
+            for layer_name in attn_group.layer_names:
+                per_layer[layer_name] = view
+        return per_layer
 
-        If slot_mapping is provided, copies it into the buffer first.
-        """
-        if slot_mapping is not None:
-            num_actual = slot_mapping.shape[0]
-            self._slot_mapping_buffer[:num_actual].copy_(slot_mapping)
-            if num_tokens > num_actual:
-                self._slot_mapping_buffer[num_actual:num_tokens].fill_(PADDING_SLOT_ID)
+    def set_per_group_attn_metadata(
+        self,
+        gid: int,
+        block_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        self._per_group_block_tables[gid] = block_table
+        self._per_group_slot_mappings[gid] = slot_mapping
 
-        view = self._slot_mapping_buffer[:num_tokens]
-        return {name: view for name in self._draft_attn_layer_names}
+    def _slot_mapping_buffer_for(self, gid: int) -> torch.Tensor:
+        if gid == self.kv_cache_gid:
+            return self._slot_mapping_buffer
+        buf = self._per_group_slot_mapping_buffers.get(gid)
+        if buf is None:
+            buf = torch.zeros(self.max_positions, dtype=torch.int64, device=self.device)
+            self._per_group_slot_mapping_buffers[gid] = buf
+        return buf
 
     def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode) -> None:
         """Initialize cudagraph dispatcher keys for the drafter.
@@ -1003,9 +1032,20 @@ class SpecDecodeBaseProposer:
     ) -> tuple[list[object], dict[str, object]]:
         per_group_attn_metadata: list[object] = []
         per_layer_attn_metadata: dict[str, object] = {}
+        num_reqs = common_attn_metadata.num_reqs
+        num_actual_tokens = common_attn_metadata.num_actual_tokens
         for attn_group in self.draft_attn_groups:
+            gid = attn_group.kv_cache_group_id
+            if gid in self._per_group_block_tables:
+                cm = copy(common_attn_metadata)
+                cm.block_table_tensor = self._per_group_block_tables[gid][:num_reqs]
+                if gid in self._per_group_slot_mappings:
+                    slot_mapping = self._per_group_slot_mappings[gid]
+                    cm.slot_mapping = slot_mapping[:num_actual_tokens]
+            else:
+                cm = common_attn_metadata
             attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
-                common_attn_metadata=common_attn_metadata, draft_index=draft_index
+                common_attn_metadata=cm, draft_index=draft_index
             )
             per_group_attn_metadata.append(attn_metadata)
             for layer_name in attn_group.layer_names:
@@ -1712,27 +1752,7 @@ class SpecDecodeBaseProposer:
         return use_aux_hidden_state
 
     def validate_same_kv_cache_group(self, kv_cache_config: KVCacheConfig) -> None:
-        """
-        Validate that all drafting layers belong to the same KVCacheGroup.
-        Need this assumption to ensure all drafting layers can use the
-        same AttentionMetadata.
-        May extend to multiple AttentionMetadata in the future.
-        """
-        kv_cache_groups: dict[str, int] = {}
-        for id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
-            for layer_name in kv_cache_group.layer_names:
-                kv_cache_groups[layer_name] = id
-        assert (
-            len(
-                set(
-                    [
-                        kv_cache_groups[layer_name]
-                        for layer_name in self._draft_attn_layer_names
-                    ]
-                )
-            )
-            == 1
-        ), "All drafting layers should belong to the same kv cache group"
+        """Retained as an extension hook for proposers with stricter layouts."""
 
     def initialize_attn_backend(
         self,
@@ -1748,52 +1768,67 @@ class SpecDecodeBaseProposer:
             AttentionLayerBase,  # type: ignore[type-abstract]
         )
 
-        # Find which kv_cache_group the draft layers belong to
         self.validate_same_kv_cache_group(kv_cache_config)
-        kv_cache_spec = None
+
+        layer_to_gid: dict[str, int] = {}
+        layer_to_spec: dict[str, KVCacheSpec] = {}
         for gid, group in enumerate(kv_cache_config.kv_cache_groups):
-            if self._draft_attn_layer_names & set(group.layer_names):
-                self.kv_cache_gid = gid
-                kv_cache_spec = group.kv_cache_spec
-                break
-
-        attention_groups: dict[tuple[str, str], AttentionGroup] = {}
-        if kv_cache_spec is not None:
-            # _draft_attn_layer_names is a set; iterate in sorted order so
-            # that attention_groups (and anything derived from its first
-            # element) is deterministic across processes.
-            for layer_name in sorted(self._draft_attn_layer_names):
-                attn_backend = all_attn_layers[layer_name].get_attn_backend()
-                backend_key = attn_backend.full_cls_name()
-                if backend_key not in attention_groups:
-                    layer_kv_cache_spec = kv_cache_spec
-                    if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                        layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[
-                            layer_name
-                        ]
-
-                    kernel_block_size = (
-                        kernel_block_sizes[self.kv_cache_gid]
-                        if kernel_block_sizes is not None
-                        and self.kv_cache_gid < len(kernel_block_sizes)
-                        else None
-                    )
-                    attn_group = AttentionGroup(
-                        backend=attn_backend,
-                        layer_names=[layer_name],
-                        kv_cache_spec=layer_kv_cache_spec,
-                        kv_cache_group_id=self.kv_cache_gid,
-                    )
-                    attn_group.create_metadata_builders(
-                        self.vllm_config,
-                        self.device,
-                        kernel_block_size=kernel_block_size,
-                    )
-                    attention_groups[backend_key] = attn_group
+            group_spec = group.kv_cache_spec
+            for layer_name in group.layer_names:
+                layer_to_gid[layer_name] = gid
+                if isinstance(group_spec, UniformTypeKVCacheSpecs):
+                    if layer_name in group_spec.kv_cache_specs:
+                        layer_to_spec[layer_name] = group_spec.kv_cache_specs[layer_name]
+                    else:
+                        target_layer_name = getattr(
+                            all_attn_layers.get(layer_name),
+                            "kv_sharing_target_layer_name",
+                            None,
+                        )
+                        if (
+                            target_layer_name
+                            and target_layer_name in group_spec.kv_cache_specs
+                        ):
+                            layer_to_spec[layer_name] = group_spec.kv_cache_specs[
+                                target_layer_name
+                            ]
+                        else:
+                            layer_to_spec[layer_name] = group_spec
                 else:
-                    attention_groups[backend_key].layer_names.append(layer_name)
+                    layer_to_spec[layer_name] = group_spec
+
+        attention_groups: dict[tuple[tuple[str, str], int], AttentionGroup] = {}
+        for layer_name in sorted(self._draft_attn_layer_names):
+            if layer_name not in layer_to_spec:
+                continue
+            attn_backend = all_attn_layers[layer_name].get_attn_backend()
+            gid = layer_to_gid[layer_name]
+            group_key = (attn_backend.full_cls_name(), gid)
+            if group_key not in attention_groups:
+                kernel_block_size = (
+                    kernel_block_sizes[gid]
+                    if kernel_block_sizes is not None and gid < len(kernel_block_sizes)
+                    else None
+                )
+                attn_group = AttentionGroup(
+                    backend=attn_backend,
+                    layer_names=[layer_name],
+                    kv_cache_spec=layer_to_spec[layer_name],
+                    kv_cache_group_id=gid,
+                )
+                attn_group.create_metadata_builders(
+                    self.vllm_config,
+                    self.device,
+                    kernel_block_size=kernel_block_size,
+                )
+                attention_groups[group_key] = attn_group
+            else:
+                attention_groups[group_key].layer_names.append(layer_name)
 
         self.draft_attn_groups = list(attention_groups.values())
+        if not self.draft_attn_groups:
+            raise ValueError("No KV cache groups were found for draft attention layers")
+        self.kv_cache_gid = self.draft_attn_groups[0].kv_cache_group_id
         if kernel_block_sizes is not None and 0 <= self.kv_cache_gid < len(
             kernel_block_sizes
         ):

@@ -2614,8 +2614,8 @@ class GPUModelRunner(
                 else:
                     spec_decode_common_attn_metadata = cm
             # Capture per-group block tables for multi-group proposers.
-            if hasattr(self, "drafter") and isinstance(
-                self.drafter, Step3p5MTPProposer
+            if hasattr(self, "drafter") and hasattr(
+                self.drafter, "set_per_group_attn_metadata"
             ):
                 self.drafter.set_per_group_attn_metadata(
                     kv_cache_gid, cm.block_table_tensor, cm.slot_mapping

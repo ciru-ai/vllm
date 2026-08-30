@@ -52,14 +52,21 @@ def _use_rocm_sparse_triton(
     num_decodes: int,
     num_decode_tokens: int,
     max_query_len: int,
+    aiter_mla_available: bool = True,
 ) -> bool:
     """Select the rope-free BF16 path not supported by AITER sparse MLA."""
     plain_decode = num_decode_tokens == num_decodes
     return (
         not kv_cache_dtype.startswith("fp8")
         and head_size == kv_lora_rank
-        and plain_decode
-        and (num_prefills > 0 or (num_decodes > 0 and max_query_len == 1))
+        and (plain_decode or not aiter_mla_available)
+        and (
+            num_prefills > 0
+            or (
+                num_decodes > 0
+                and (max_query_len == 1 or not aiter_mla_available)
+            )
+        )
     )
 
 
@@ -608,6 +615,7 @@ class ROCMAiterMLASparseMetadataBuilder(
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             max_query_len=common_attn_metadata.max_query_len,
+            aiter_mla_available=bool(rocm_aiter_ops.is_mla_enabled()),
         )
         work_meta_data = None
         work_indptr = None
@@ -794,6 +802,7 @@ class ROCMAiterMLASparseImpl(MLAAttentionImpl[ROCMAiterMLASparseMetadata]):
             num_decodes=attn_metadata.num_decodes,
             num_decode_tokens=attn_metadata.num_decode_tokens,
             max_query_len=attn_metadata.max_query_len,
+            aiter_mla_available=bool(rocm_aiter_ops.is_mla_enabled()),
         ):
             rocm_sparse_attn_prefill(
                 q=q,

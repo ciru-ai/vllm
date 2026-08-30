@@ -99,6 +99,19 @@ def test_rocm_sparse_triton_route(
     )
 
 
+def test_rocm_sparse_triton_routes_spec_verify_without_aiter_mla():
+    assert _use_rocm_sparse_triton(
+        kv_cache_dtype="auto",
+        head_size=512,
+        kv_lora_rank=512,
+        num_prefills=0,
+        num_decodes=1,
+        num_decode_tokens=2,
+        max_query_len=2,
+        aiter_mla_available=False,
+    )
+
+
 def test_rocm_sparse_attention_accepts_glm_nope_dimensions():
     _validate_sparse_dims(512, 512, 0, "test")
 
