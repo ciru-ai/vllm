@@ -4981,10 +4981,15 @@ class GPUModelRunner(
                 # each rank. Their persistent batches remain row-aligned, so
                 # attach the relayed draft rows to this scheduler's local IDs.
                 local_req_ids = self.input_batch.req_ids.copy()
-                if len(local_req_ids) != len(relayed.draft_token_ids):
+                if not (
+                    len(relayed.req_ids)
+                    == len(relayed.draft_token_ids)
+                    == len(local_req_ids)
+                ):
                     raise RuntimeError(
                         "PP draft relay row mismatch: "
                         f"local={len(local_req_ids)}, "
+                        f"remote_ids={len(relayed.req_ids)}, "
                         f"remote={len(relayed.draft_token_ids)}"
                     )
                 relayed = DraftTokenIds(local_req_ids, relayed.draft_token_ids)

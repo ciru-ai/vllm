@@ -561,6 +561,16 @@ class VllmConfig:
         # PP requires PP-size concurrent batches to fill the pipeline.
         # Async scheduling requires 2 concurrent batches to overlap.
         pp_size = self.parallel_config.pipeline_parallel_size
+        # V1 external_launcher drives one independent engine per PP rank and
+        # broadcasts PP outputs to keep their schedulers aligned. It does not
+        # support overlapping microbatches, so a PP-sized queue can let one
+        # rank retire a request while another still launches its next step.
+        if (
+            pp_size > 1
+            and self.parallel_config.distributed_executor_backend
+            == "external_launcher"
+        ):
+            return 1
         if self.scheduler_config.async_scheduling:
             if self.use_v2_model_runner:
                 return pp_size + 1
