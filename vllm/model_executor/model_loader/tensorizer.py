@@ -42,7 +42,10 @@ try:
     from tensorizer.stream_io import open_stream
     from tensorizer.utils import convert_bytes, get_mem_usage, no_init_or_tensor
 
-except ImportError:
+# tensorizer 2.10.1 can raise KeyError while constructing its constants on
+# Python 3.14. It is an optional loader, so leave it unavailable instead of
+# preventing unrelated safetensors loaders from importing.
+except (ImportError, KeyError):
     tensorizer = PlaceholderModule("tensorizer")
     DecryptionParams = tensorizer.placeholder_attr("DecryptionParams")
     EncryptionParams = tensorizer.placeholder_attr("EncryptionParams")
