@@ -21,7 +21,11 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
-from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.utils import (
+    make_empty_intermediate_tensors_factory,
+    maybe_prefix,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
@@ -207,7 +211,7 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         )
 
 
-class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -216,6 +220,9 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         self.set_moe_parameters()
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states", "residual"], self.config.hidden_size
+        )
 
     def set_moe_parameters(self):
         self.num_moe_layers = self.config.num_nextn_predict_layers
@@ -322,6 +329,19 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             # prefix to match.
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
+            # Candidate A stores the embedding once at the target-model scope,
+            # while this last-rank-only draft owns a real embedding table.  The
+            # normal spec-layer filter below would otherwise skip it.
+            if "embed_tokens" in name:
+                param = params_dict.get(name)
+                if param is not None:
+                    weight_loader = getattr(param, "weight_loader", None)
+                    if weight_loader is not None:
+                        weight_loader(param, loaded_weight)
+                    else:
+                        param.data.copy_(loaded_weight)
+                    loaded_params.add(name)
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue

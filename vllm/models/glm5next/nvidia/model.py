@@ -649,6 +649,28 @@ class Glm5NextModel(nn.Module):
             "num_attention_heads must be divisible by world_size"
         )
 
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        # A PP boundary is a completed mHC layer.  Materializing hc_post at
+        # the sender leaves one widened residual stream for the next stage;
+        # the deferred post/comb state is intentionally local to the stage.
+        hidden_shape = (batch_size, self.config.hidden_size)
+        if self.config.mhc:
+            hidden_shape = (
+                batch_size,
+                self.config.mhc_num_residual_streams,
+                self.config.hidden_size,
+            )
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(hidden_shape, dtype=dtype, device=device)
+            }
+        )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -671,11 +693,7 @@ class Glm5NextModel(nn.Module):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-            # post/comb (deferred mHC hc_post state) are not propagated across
-            # PP ranks; the receiving rank's first mHC layer uses standalone pre.
-            post = None
-            comb = None
+            residual = post = comb = None
 
         full_num_tokens = positions.shape[0]
         if self.is_sequence_parallel:
@@ -687,14 +705,17 @@ class Glm5NextModel(nn.Module):
             )
 
         if not get_pp_group().is_last_rank:
-            # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
-            # so this branch is not exercised. post/comb are the deferred
-            # hc_post state of this rank's last mHC layer; a future PP path
-            # would need to propagate them, but for now they are dropped (the
-            # receiving rank's first layer would fall back to standalone pre).
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            # Finish the last local layer before transport.  The next rank's
+            # first layer then performs a normal hc_pre on this widened state.
+            # This is the same one-tensor PP contract used by DeepSeek-V4 and
+            # avoids transporting the transient residual/post/comb tuple.
+            if post is not None:
+                assert residual is not None and comb is not None
+                last_layer = self._active_layers[-1]
+                hidden_states = last_layer.hc_post(
+                    hidden_states, residual, post, comb
+                )
+            return IntermediateTensors({"hidden_states": hidden_states})
 
         if self.is_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
@@ -876,6 +897,9 @@ class Glm5NextForCausalLM(
         self.model = Glm5NextModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+            self.model.make_empty_intermediate_tensors
+        )
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 self.config.vocab_size,
@@ -1035,9 +1059,9 @@ class Glm5NextForConditionalGeneration(
                 architectures=["Glm5NextForCausalLM"],
             )
 
-        # Glm5NextForCausalLM does not implement make_empty_intermediate_tensors,
-        # so pipeline parallelism is gated off (consistent with the text-only
-        # model) and we intentionally do not alias it here.
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+            self.language_model.make_empty_intermediate_tensors
+        )
 
     def get_encoder_cudagraph_config(self):
         # This vision tower does not produce the absolute position embedding
