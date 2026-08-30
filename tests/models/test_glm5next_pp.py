@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 from types import SimpleNamespace
 
 import torch
@@ -74,6 +75,14 @@ def test_rocm_sparse_backends_pin_exact_64_token_pages(monkeypatch):
         == [1, 64]
     )
     assert ROCMAiterMLASparseBackend.get_supported_kernel_block_sizes() == [1, 64]
+
+
+def test_glm5next_vision_tower_is_owned_only_by_first_pp_rank():
+    source = inspect.getsource(Glm5NextForConditionalGeneration.__init__)
+    gate = source.index("if get_pp_group().is_first_rank:")
+    tower = source.index("self.visual = Glm5NextVisionTransformer(")
+    fallback = source.index("self.visual = PPMissingLayer()")
+    assert gate < tower < fallback
 
 
 def test_glm5next_pp_factory_uses_native_four_stream_shape():
