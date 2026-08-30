@@ -4691,7 +4691,9 @@ class GPUModelRunner(
 
         spec_config = self.speculative_config
         draft_after_bookkeeping = False
-        if spec_config is not None:
+        # The drafter exists only on the last PP rank. Proposed ids are
+        # relayed to peer schedulers in take_draft_token_ids().
+        if spec_config is not None and get_pp_group().is_last_rank:
             # Decide whether to run the drafter or zero out draft tokens.
             input_fits_in_drafter = self._input_fits_in_drafter(
                 spec_decode_common_attn_metadata
@@ -4948,10 +4950,25 @@ class GPUModelRunner(
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
-        if not self.num_spec_tokens or not self._draft_token_req_ids:
+        if not self.num_spec_tokens:
             return None
-        draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
-        return DraftTokenIds(req_ids, draft_token_ids)
+
+        pp = get_pp_group()
+        output: DraftTokenIds | None = None
+        if pp.is_last_rank and self._draft_token_req_ids:
+            draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
+            output = DraftTokenIds(req_ids, draft_token_ids)
+
+        # Every external_launcher rank owns an independent sync scheduler.
+        if self.broadcast_pp_output:
+            relayed = pp.broadcast_object(
+                output if pp.is_last_rank else None,
+                src=pp.world_size - 1,
+            )
+            assert relayed is None or isinstance(relayed, DraftTokenIds)
+            return relayed
+
+        return output
 
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
