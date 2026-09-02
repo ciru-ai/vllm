@@ -326,6 +326,9 @@ def _compute_slot_mappings_kernel(
             local_positions = virtual_block_indices * kv_block_size + local_offsets
 
         block_indices = local_positions // kernel_block_size
+        # A one-block circular KpoolTail cache keeps absolute positions but
+        # has only one block-table entry. Keep its lookup inside that row.
+        block_indices = tl.minimum(block_indices, block_table_stride - 1)
         block_offsets = local_positions % kernel_block_size
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices,

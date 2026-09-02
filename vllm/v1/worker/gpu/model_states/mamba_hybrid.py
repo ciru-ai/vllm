@@ -302,6 +302,7 @@ class MambaHybridModelState(DefaultModelState):
             query_start_loc_cpu=query_start_loc_cpu,
             max_query_len=max_query_len,
             seq_lens=input_batch.seq_lens,
+            positions=input_batch.positions,
             max_seq_len=max_seq_len,
             block_tables=block_tables,
             slot_mappings=slot_mappings,

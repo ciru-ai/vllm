@@ -11,6 +11,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
+from vllm.model_executor.model_loader.glm53_runtime_prepack_loader import (
+    Glm53RuntimePrepackLoader,
+)
 from vllm.model_executor.model_loader.modelexpress_loader import (
     ModelExpressModelLoader,
 )
@@ -34,6 +37,7 @@ LoadFormats = Literal[
     "hf",
     "dummy",
     "fastsafetensors",
+    "glm53_runtime_prepack",
     "instanttensor",
     "mistral",
     "modelexpress",
@@ -50,6 +54,7 @@ _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "hf": DefaultModelLoader,
     "dummy": DummyModelLoader,
     "fastsafetensors": DefaultModelLoader,
+    "glm53_runtime_prepack": Glm53RuntimePrepackLoader,
     "instanttensor": DefaultModelLoader,
     "mistral": DefaultModelLoader,
     "modelexpress": ModelExpressModelLoader,
@@ -150,6 +155,7 @@ __all__ = [
     "ModelExpressModelLoader",
     "DefaultModelLoader",
     "DummyModelLoader",
+    "Glm53RuntimePrepackLoader",
     "RunaiModelStreamerLoader",
     "ShardedStateLoader",
     "TensorizerLoader",

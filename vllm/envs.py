@@ -254,6 +254,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB: int | None = None
     VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB: int | None = None
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB: int | None = None
+    VLLM_ROCM_MOE_M1_DIRECT_ROUTE: bool = False
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
     VLLM_LOOPBACK_IP: str = ""
@@ -264,6 +265,30 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_MFMA_PAGE_ATTN: bool = False
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER: bool = True
+    VLLM_NHI_ALLREDUCE: bool = False
+    VLLM_NHI_M4_ALLREDUCE: bool = False
+    VLLM_NHI_M8_ALLREDUCE: bool = False
+    VLLM_NHI_PP768_ALLREDUCE: bool = False
+    VLLM_NHI_DEVICE: str = ""
+    VLLM_NHI_LIBRARY: str = ""
+    VLLM_NHI_M4_LIBRARY: str = ""
+    VLLM_NHI_M8_LIBRARY: str = ""
+    VLLM_NHI_PP768_LIBRARY: str = ""
+    VLLM_NHI_TIMEOUT_MS: int = 1000
+    VLLM_ROCM_MOE_NATIVE_N32_KWORD_LAYOUT: bool = False
+    VLLM_GLM53_HYBRID_F1_ENABLED: bool = False
+    VLLM_GLM53_HYBRID_MANIFEST: str = ""
+    VLLM_GLM53_HYBRID_LIBRARY: str = ""
+    VLLM_GLM53_HYBRID_MAX_M: int = 8
+    VLLM_GLM53_HYBRID_IU4_M1_ENABLED: bool = False
+    VLLM_GLM53_HYBRID_IU4_M1_LIBRARY: str = ""
+    VLLM_GLM53_HYBRID_IU4_CANONICAL_ENABLED: bool = False
+    VLLM_GLM53_HYBRID_IU4_CANONICAL_M1_LIBRARY: str = ""
+    VLLM_GLM53_EXPORT_RUNTIME_PREPACK_V1: bool = False
+    VLLM_GLM53_HYBRID_TOP8_EPILOGUE_ENABLED: bool = False
+    VLLM_GLM53_HYBRID_TOP8_EPILOGUE_LIBRARY: str = ""
+    VLLM_GLM53_RESIDENT_G128_ENABLED: bool = False
+    VLLM_GLM53_RESIDENT_G128_LIBRARY: str = ""
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -1862,6 +1887,85 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use FlashInfer allreduce
     "VLLM_ALLREDUCE_USE_FLASHINFER": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER", "1"))
+    ),
+    # Experimental two-node direct-NHI BF16 decode all-reduce.
+    "VLLM_NHI_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_NHI_ALLREDUCE", "0"))
+    ),
+    "VLLM_NHI_M4_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_NHI_M4_ALLREDUCE", "0"))
+    ),
+    "VLLM_NHI_M8_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_NHI_M8_ALLREDUCE", "0"))
+    ),
+    "VLLM_NHI_PP768_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_NHI_PP768_ALLREDUCE", "0"))
+    ),
+    "VLLM_NHI_DEVICE": lambda: os.getenv("VLLM_NHI_DEVICE", ""),
+    "VLLM_NHI_LIBRARY": lambda: os.getenv("VLLM_NHI_LIBRARY", ""),
+    "VLLM_NHI_M4_LIBRARY": lambda: os.getenv("VLLM_NHI_M4_LIBRARY", ""),
+    "VLLM_NHI_M8_LIBRARY": lambda: os.getenv("VLLM_NHI_M8_LIBRARY", ""),
+    "VLLM_NHI_PP768_LIBRARY": lambda: os.getenv(
+        "VLLM_NHI_PP768_LIBRARY", ""
+    ),
+    "VLLM_NHI_TIMEOUT_MS": lambda: int(
+        os.getenv("VLLM_NHI_TIMEOUT_MS", "1000")
+    ),
+    "VLLM_ROCM_MOE_M1_DIRECT_ROUTE": lambda: bool(
+        int(os.getenv("VLLM_ROCM_MOE_M1_DIRECT_ROUTE", "0"))
+    ),
+    "VLLM_ROCM_MOE_NATIVE_N32_KWORD_LAYOUT": lambda: bool(
+        int(os.getenv("VLLM_ROCM_MOE_NATIVE_N32_KWORD_LAYOUT", "0"))
+    ),
+    # GLM-5.3 gfx1151 experiment: preserve compressed-tensors everywhere and
+    # replace only the fused KDA input projection with its F1 M=1..8 packet.
+    "VLLM_GLM53_HYBRID_F1_ENABLED": lambda: bool(
+        int(os.getenv("VLLM_GLM53_HYBRID_F1_ENABLED", "0"))
+    ),
+    "VLLM_GLM53_HYBRID_MANIFEST": lambda: os.getenv(
+        "VLLM_GLM53_HYBRID_MANIFEST", ""
+    ),
+    "VLLM_GLM53_HYBRID_LIBRARY": lambda: os.getenv(
+        "VLLM_GLM53_HYBRID_LIBRARY", ""
+    ),
+    "VLLM_GLM53_HYBRID_MAX_M": lambda: int(
+        os.getenv("VLLM_GLM53_HYBRID_MAX_M", "8")
+    ),
+    # Partial-panel GLM-5.3 experiment: use the native gfx1151 IU4 top-8
+    # routed-MoE path only for true M=1 decode. All other shapes retain the
+    # compressed-tensors Triton W4A16 path.
+    "VLLM_GLM53_HYBRID_IU4_M1_ENABLED": lambda: bool(
+        int(os.getenv("VLLM_GLM53_HYBRID_IU4_M1_ENABLED", "0"))
+    ),
+    "VLLM_GLM53_HYBRID_IU4_M1_LIBRARY": lambda: os.getenv(
+        "VLLM_GLM53_HYBRID_IU4_M1_LIBRARY", ""
+    ),
+    # Full GLM routed-MoE ownership mode. After normal CT loading, replace the
+    # expert banks with the equal-byte N32/K-word-major native layout. M>1 is
+    # consumed by the explicitly layout-aware Triton W4A16 path.
+    "VLLM_GLM53_HYBRID_IU4_CANONICAL_ENABLED": lambda: bool(
+        int(os.getenv("VLLM_GLM53_HYBRID_IU4_CANONICAL_ENABLED", "0"))
+    ),
+    "VLLM_GLM53_HYBRID_IU4_CANONICAL_M1_LIBRARY": lambda: os.getenv(
+        "VLLM_GLM53_HYBRID_IU4_CANONICAL_M1_LIBRARY", ""
+    ),
+    "VLLM_GLM53_EXPORT_RUNTIME_PREPACK_V1": lambda: bool(
+        int(os.getenv("VLLM_GLM53_EXPORT_RUNTIME_PREPACK_V1", "0"))
+    ),
+    # Fixed-route Wave32 reduction for canonical GLM top-k=8 prefill only.
+    # Decode and every unsupported shape retain the stock moe_sum path.
+    "VLLM_GLM53_HYBRID_TOP8_EPILOGUE_ENABLED": lambda: bool(
+        int(os.getenv("VLLM_GLM53_HYBRID_TOP8_EPILOGUE_ENABLED", "0"))
+    ),
+    "VLLM_GLM53_HYBRID_TOP8_EPILOGUE_LIBRARY": lambda: os.getenv(
+        "VLLM_GLM53_HYBRID_TOP8_EPILOGUE_LIBRARY", ""
+    ),
+    # Proper-shape resident W13/W2 candidate for canonical GLM G128 banks.
+    "VLLM_GLM53_RESIDENT_G128_ENABLED": lambda: bool(
+        int(os.getenv("VLLM_GLM53_RESIDENT_G128_ENABLED", "0"))
+    ),
+    "VLLM_GLM53_RESIDENT_G128_LIBRARY": lambda: os.getenv(
+        "VLLM_GLM53_RESIDENT_G128_LIBRARY", ""
     ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(

@@ -1,0 +1,37 @@
+# Curated production overlay copied from the qualified Ciru runtime.
+# Base commit: dccf404cd4ae5e9c06e940ad9bc49ee8f762a275
+# Backup snapshots, evidence files, and generated binaries are excluded.
+vllm/config/load.py
+vllm/config/model.py
+vllm/config/vllm.py
+vllm/distributed/device_communicators/cuda_communicator.py
+vllm/distributed/device_communicators/nhi_all_reduce.py
+vllm/distributed/device_communicators/nhi_all_reduce_m4.py
+vllm/distributed/device_communicators/nhi_all_reduce_m8.py
+vllm/distributed/device_communicators/nhi_all_reduce_pp768.py
+vllm/envs.py
+vllm/model_executor/kernels/linear/mixed_precision/rdna_hybrid_w4a16.py
+vllm/model_executor/layers/fused_moe/experts/triton_moe.py
+vllm/model_executor/layers/fused_moe/fused_moe.py
+vllm/model_executor/layers/fused_moe/routed_experts.py
+vllm/model_executor/layers/quantization/__init__.py
+vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16.py
+vllm/model_executor/layers/quantization/glm53_hybrid.py
+vllm/model_executor/layers/quantization/glm53_oproj_capture.py
+vllm/model_executor/model_loader/__init__.py
+vllm/model_executor/model_loader/glm53_runtime_prepack_loader.py
+vllm/model_executor/models/glm53_dflash_dense_capture.py
+vllm/model_executor/models/qwen3_dflash.py
+vllm/models/glm5next/nvidia/kda.py
+vllm/models/glm5next/nvidia/model.py
+vllm/platforms/rocm.py
+vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+vllm/v1/core/kv_cache_utils.py
+vllm/v1/spec_decode/dflash.py
+vllm/v1/worker/block_table.py
+vllm/v1/worker/gpu/block_table.py
+vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+vllm/v1/worker/gpu/spec_decode/dflash/utils.py
+vllm/v1/worker/gpu_model_runner.py
+vllm/v1/worker/gpu_worker.py

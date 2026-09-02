@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# The ROCm wheel helper uses /bin/bash, which does not exist on NixOS.
+exec /run/current-system/sw/bin/bash \
+  "${ROCM_PATH:?ROCM_PATH must identify the ROCm SDK}/bin/hipcc_cmake_linker_helper" \
+  "$@"

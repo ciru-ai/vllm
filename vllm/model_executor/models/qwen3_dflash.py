@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import io
+import os
 from collections.abc import Iterable
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -18,8 +20,10 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -52,7 +56,62 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+_DFLASH_GATE_UP_M = 8
+_DFLASH_GATE_UP_K = 4096
+_DFLASH_GATE_UP_N = 12288
+_DFLASH_GATE_UP_WORKSPACE_BYTES = _DFLASH_GATE_UP_M * 9216
+_DFLASH_GATE_UP_W8_WORKSPACE_BYTES = _DFLASH_GATE_UP_M * (
+    _DFLASH_GATE_UP_K + (_DFLASH_GATE_UP_K // 32) * 4
+)
+_DFLASH_GATE_UP_LIBRARY: Path | None = None
+_DFLASH_GATE_UP_W8_LIBRARY: Path | None = None
+
+
+def _load_dflash_gate_up_library(path_value: str) -> None:
+    global _DFLASH_GATE_UP_LIBRARY
+    path = Path(path_value).expanduser().resolve()
+    if _DFLASH_GATE_UP_LIBRARY == path:
+        return
+    if _DFLASH_GATE_UP_LIBRARY is not None:
+        raise RuntimeError(
+            f"DFlash gate/up library already loaded from {_DFLASH_GATE_UP_LIBRARY}"
+        )
+    torch.ops.load_library(str(path))
+    if not hasattr(torch.ops.glm53_dflash_gate_up_m8, "linear_out"):
+        raise RuntimeError("DFlash gate/up library did not register linear_out")
+    _DFLASH_GATE_UP_LIBRARY = path
+
+
+def _load_dflash_gate_up_w8_library(path_value: str) -> None:
+    global _DFLASH_GATE_UP_W8_LIBRARY
+    path = Path(path_value).expanduser().resolve()
+    if _DFLASH_GATE_UP_W8_LIBRARY == path:
+        return
+    if _DFLASH_GATE_UP_W8_LIBRARY is not None:
+        raise RuntimeError(
+            "DFlash gate/up W8 library already loaded from "
+            f"{_DFLASH_GATE_UP_W8_LIBRARY}"
+        )
+    torch.ops.load_library(str(path))
+    if not hasattr(torch.ops.glm53_dflash_gate_up_w8a8_m8, "linear_out"):
+        raise RuntimeError("DFlash gate/up W8 library did not register linear_out")
+    _DFLASH_GATE_UP_W8_LIBRARY = path
+
+
 _SLIDING_ATTENTION = "sliding_attention"
+
+
+def dflash_uses_local_tp(vllm_config: VllmConfig) -> bool:
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None:
+        return False
+    draft_parallel_config = speculative_config.draft_parallel_config
+    return bool(
+        os.environ.get("VLLM_DFLASH_LOCAL_TP1", "0") == "1"
+        and draft_parallel_config is not None
+        and draft_parallel_config.tensor_parallel_size == 1
+        and vllm_config.parallel_config.tensor_parallel_size > 1
+    )
 
 
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
@@ -88,9 +147,25 @@ def dflash_target_rope_is_neox_style(target_model: nn.Module) -> bool | None:
         if hasattr(target_model, "get_language_model")
         else target_model
     )
+    # Multimodal targets can expose only the outer config here; the text config
+    # carrying the actual attention dimensions then lives under ``text_config``.
+    # Inspect both levels (and the inner model, when present) before falling
+    # back to scanning built rotary modules.
+    config_owners = (target_model, language_model, getattr(language_model, "model", None))
+    for owner in config_owners:
+        target_config = getattr(owner, "config", None)
+        for config in (target_config, getattr(target_config, "text_config", None)):
+            if getattr(config, "qk_rope_head_dim", None) == 0:
+                # Rope-free MLA targets can still contain an indexer
+                # RotaryEmbedding object with a zero-width head. Its layout
+                # flag is unrelated to the DFlash head. These Qwen-derived
+                # draft checkpoints use the standard NeoX layout.
+                return True
     for module in language_model.modules():
         style = getattr(module, "is_neox_style", None)
-        if isinstance(style, bool):
+        head_size = getattr(module, "head_size", None)
+        rotary_dim = getattr(module, "rotary_dim", None)
+        if isinstance(style, bool) and head_size != 0 and rotary_dim != 0:
             return style
     return None
 
@@ -194,11 +269,13 @@ class DFlashQwen3Attention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
+        disable_tp: bool = False,
     ) -> None:
         super().__init__()
         self.layer_name = prefix
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        self.disable_tp = disable_tp
+        tp_size = 1 if disable_tp else get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -221,6 +298,7 @@ class DFlashQwen3Attention(nn.Module):
             bias=attention_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+            disable_tp=disable_tp,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -228,6 +306,7 @@ class DFlashQwen3Attention(nn.Module):
             bias=attention_bias,  # DFlash has o_proj bias when using attention bias
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            disable_tp=disable_tp,
         )
 
         self.rotary_emb = get_rope(
@@ -288,6 +367,205 @@ class DFlashQwen3Attention(nn.Module):
         return output
 
 
+class DFlashQwen3MLP(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+        disable_tp: bool,
+        layer_idx: int,
+    ) -> None:
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.disable_tp = disable_tp
+        self._gate_up_s4_armed = False
+        self._gate_up_w8a8_armed = False
+        self._dense_capture = None
+        if os.environ.get("VLLM_GLM53_DFLASH_DENSE_CAPTURE", "0") == "1":
+            from .glm53_dflash_dense_capture import capture_input
+
+            self._dense_capture = capture_input
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+            disable_tp=disable_tp,
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+            disable_tp=disable_tp,
+        )
+        if hidden_act != "silu":
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. Only silu is supported."
+            )
+        self.act_fn = SiluAndMul()
+
+    def arm_gate_up_s4(self) -> None:
+        library = os.environ.get("VLLM_GLM53_DFLASH_GATE_UP_S4_LIBRARY", "")
+        packet_root = os.environ.get("VLLM_GLM53_DFLASH_GATE_UP_S4_PACKET_ROOT", "")
+        if not library or not packet_root:
+            raise ValueError("DFlash gate/up S4 requires library and packet-root paths")
+        if self.disable_tp:
+            raise ValueError("DFlash gate/up S4 v1 supports the current TP2 draft only")
+        _load_dflash_gate_up_library(library)
+
+        rank = get_tensor_model_parallel_rank()
+        packet_path = (
+            Path(packet_root).expanduser().resolve()
+            / f"rank{rank}"
+            / f"layer{self.layer_idx}-gate-up-rank{rank}-s4g32-scale8.safetensors"
+        )
+        from safetensors.torch import load_file
+
+        packet = load_file(str(packet_path), device="cpu")
+        weight = packet["weight_s4_dot_i32"].contiguous()
+        codes = packet["scale8_codes_dot"].contiguous()
+        offset = int(packet["scale8_offset_i16"].item())
+        if weight.dtype != torch.int32 or tuple(weight.shape) != (384, 512, 32):
+            raise ValueError(f"invalid DFlash gate/up weight packet {packet_path}")
+        if codes.dtype != torch.uint8 or tuple(codes.shape) != (384, 128, 32):
+            raise ValueError(f"invalid DFlash gate/up Scale8 packet {packet_path}")
+
+        device = self.gate_up_proj.weight.device
+        lut = torch.zeros(256, dtype=torch.float32)
+        indices = torch.arange(1, 256, dtype=torch.float32)
+        lut[1:] = torch.exp2((indices - 1.0 + float(offset)) / 16.0)
+        self.register_buffer("gate_up_s4_weight", weight.to(device), persistent=False)
+        self.register_buffer("gate_up_s4_codes", codes.to(device), persistent=False)
+        self.register_buffer("gate_up_s4_lut", lut.to(device), persistent=False)
+        self.register_buffer(
+            "gate_up_s4_output",
+            torch.empty(
+                (_DFLASH_GATE_UP_M, _DFLASH_GATE_UP_N),
+                dtype=torch.bfloat16,
+                device=device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "gate_up_s4_workspace",
+            torch.empty(
+                _DFLASH_GATE_UP_WORKSPACE_BYTES,
+                dtype=torch.uint8,
+                device=device,
+            ),
+            persistent=False,
+        )
+        self._gate_up_s4_armed = True
+        logger.info(
+            "DFlash M8 gate/up S4+Scale8 armed for layer %d rank %d",
+            self.layer_idx,
+            rank,
+        )
+
+    def arm_gate_up_w8a8(self) -> None:
+        library = os.environ.get("VLLM_GLM53_DFLASH_GATE_UP_W8A8_LIBRARY", "")
+        packet_root = os.environ.get(
+            "VLLM_GLM53_DFLASH_GATE_UP_W8A8_PACKET_ROOT", ""
+        )
+        if not library or not packet_root:
+            raise ValueError("DFlash gate/up W8A8 requires library and packet-root paths")
+        if self.disable_tp:
+            raise ValueError("DFlash gate/up W8A8 v1 supports the current TP2 draft only")
+        _load_dflash_gate_up_w8_library(library)
+
+        rank = get_tensor_model_parallel_rank()
+        packet_path = (
+            Path(packet_root).expanduser().resolve()
+            / f"rank{rank}"
+            / f"layer{self.layer_idx}-gate-up-rank{rank}-w8g32-scale8.safetensors"
+        )
+        from safetensors.torch import load_file
+
+        packet = load_file(str(packet_path), device="cpu")
+        weight = packet["weight_s8_dot_i32"].contiguous()
+        codes = packet["scale8_codes_dot"].contiguous()
+        offset = int(packet["scale8_offset_i16"].item())
+        if weight.dtype != torch.int32 or tuple(weight.shape) != (384, 1024, 32):
+            raise ValueError(f"invalid DFlash gate/up W8 weight packet {packet_path}")
+        if codes.dtype != torch.uint8 or tuple(codes.shape) != (384, 128, 32):
+            raise ValueError(f"invalid DFlash gate/up W8 Scale8 packet {packet_path}")
+
+        device = self.gate_up_proj.weight.device
+        lut = torch.zeros(256, dtype=torch.float32)
+        indices = torch.arange(1, 256, dtype=torch.float32)
+        lut[1:] = torch.exp2((indices - 1.0 + float(offset)) / 16.0)
+        self.register_buffer("gate_up_w8_weight", weight.to(device), persistent=False)
+        self.register_buffer("gate_up_w8_codes", codes.to(device), persistent=False)
+        self.register_buffer("gate_up_w8_lut", lut.to(device), persistent=False)
+        self.register_buffer(
+            "gate_up_w8_output",
+            torch.empty(
+                (_DFLASH_GATE_UP_M, _DFLASH_GATE_UP_N),
+                dtype=torch.bfloat16,
+                device=device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "gate_up_w8_workspace",
+            torch.empty(
+                _DFLASH_GATE_UP_W8_WORKSPACE_BYTES,
+                dtype=torch.uint8,
+                device=device,
+            ),
+            persistent=False,
+        )
+        self._gate_up_w8a8_armed = True
+        logger.info(
+            "DFlash M8 gate/up W8A8+Scale8 armed for layer %d rank %d",
+            self.layer_idx,
+            rank,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._dense_capture is not None:
+            self._dense_capture(self.layer_idx, x)
+        if (
+            self._gate_up_w8a8_armed
+            and x.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and tuple(x.shape) == (_DFLASH_GATE_UP_M, _DFLASH_GATE_UP_K)
+        ):
+            gate_up = torch.ops.glm53_dflash_gate_up_w8a8_m8.linear_out(
+                x,
+                self.gate_up_w8_weight,
+                self.gate_up_w8_codes,
+                self.gate_up_w8_lut,
+                self.gate_up_w8_output,
+                self.gate_up_w8_workspace,
+            )
+        elif (
+            self._gate_up_s4_armed
+            and x.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and tuple(x.shape) == (_DFLASH_GATE_UP_M, _DFLASH_GATE_UP_K)
+        ):
+            gate_up = torch.ops.glm53_dflash_gate_up_m8.linear_out(
+                x,
+                self.gate_up_s4_weight,
+                self.gate_up_s4_codes,
+                self.gate_up_s4_lut,
+                self.gate_up_s4_output,
+                self.gate_up_s4_workspace,
+            )
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
+
 class DFlashQwen3DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -322,6 +600,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
         # that target does, or every drafted Q/K is wrong and acceptance
         # collapses with no error raised.
         is_neox_style = getattr(config, "is_neox_style", True)
+        disable_tp = dflash_uses_local_tp(vllm_config)
 
         self.self_attn = DFlashQwen3Attention(
             hidden_size=self.hidden_size,
@@ -340,13 +619,16 @@ class DFlashQwen3DecoderLayer(nn.Module):
             rope_parameters=config.rope_parameters,
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
+            disable_tp=disable_tp,
         )
-        self.mlp = Qwen3MLP(
+        self.mlp = DFlashQwen3MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
+            disable_tp=disable_tp,
+            layer_idx=layer_idx,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -418,11 +700,13 @@ class DFlashQwen3Model(nn.Module):
         )
 
         current_vllm_config = get_current_vllm_config()
+        self.disable_tp = dflash_uses_local_tp(current_vllm_config)
 
         self.embed_tokens = VocabParallelEmbedding(
             self.config.vocab_size,
             self.config.hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
+            disable_tp=self.disable_tp,
         )
 
         # Masked query slots are fed to the draft as `mask_token_id`. Most DFlash
@@ -545,6 +829,28 @@ class DFlashQwen3Model(nn.Module):
 
         # References to inner Attention layers for direct cache writes
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
+
+    def _arm_gate_up_s4(self) -> None:
+        if os.environ.get("VLLM_GLM53_DFLASH_GATE_UP_S4_ENABLED", "0") != "1":
+            return
+        layer_value = os.environ.get(
+            "VLLM_GLM53_DFLASH_GATE_UP_S4_LAYERS", "0,1,2,3,4"
+        )
+        selected = {int(value) for value in layer_value.split(",") if value.strip()}
+        for layer_index, layer in enumerate(self.layers):
+            if layer_index in selected:
+                layer.mlp.arm_gate_up_s4()
+
+    def _arm_gate_up_w8a8(self) -> None:
+        if os.environ.get("VLLM_GLM53_DFLASH_GATE_UP_W8A8_ENABLED", "0") != "1":
+            return
+        layer_value = os.environ.get(
+            "VLLM_GLM53_DFLASH_GATE_UP_W8A8_LAYERS", "0,1,2,3,4"
+        )
+        selected = {int(value) for value in layer_value.split(",") if value.strip()}
+        for layer_index, layer in enumerate(self.layers):
+            if layer_index in selected:
+                layer.mlp.arm_gate_up_w8a8()
 
     def _project_context_kv(
         self,
@@ -686,8 +992,8 @@ class DFlashQwen3Model(nn.Module):
     def _preprocess(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[tuple[str, torch.Tensor]]:
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = 1 if self.disable_tp else get_tensor_model_parallel_world_size()
+        tp_rank = 0 if self.disable_tp else get_tensor_model_parallel_rank()
         for name, loaded_weight in weights:
             if "attention_sink_bias" in name:
                 # Sink bias is per-head; shard it across TP ranks like the
@@ -728,6 +1034,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             self.config.draft_vocab_size,
             self.config.hidden_size,
             prefix=maybe_prefix(prefix, "lm_head"),
+            disable_tp=dflash_uses_local_tp(vllm_config),
         )
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size, scale=logit_scale
@@ -857,6 +1164,8 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         loader = AutoWeightsLoader(self)
         loader.load_weights(model_weights.items(), mapper=mapper)
         self.model._build_fused_kv_buffers()
+        self.model._arm_gate_up_s4()
+        self.model._arm_gate_up_w8a8()
 
     def _read_mask_embedding(self) -> torch.Tensor | None:
         """Checks for an override mask embedding in `mask_embedding.pt` and returns it.

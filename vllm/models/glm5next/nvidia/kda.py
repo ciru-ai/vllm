@@ -151,10 +151,18 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         vllm_config: VllmConfig,
         prefix: str = "",
     ) -> None:
-        # KDA projections remain BF16 because fp8 checkpoints omit their scales.
+        # KDA projections remain BF16 because quantized checkpoints omit their
+        # scales.  The explicit GLM53 hybrid config is the sole exception: it
+        # delegates the ignored KDA projections to BF16 while selecting the F1
+        # method for in_proj_qkvbfg_a.
         saved_quant_config = vllm_config.quant_config
+        use_hybrid_quant = (
+            saved_quant_config is not None
+            and saved_quant_config.get_name() == "glm53_hybrid"
+        )
         try:
-            vllm_config.quant_config = None
+            if not use_hybrid_quant:
+                vllm_config.quant_config = None
             super().__init__(config, vllm_config, prefix)
         finally:
             vllm_config.quant_config = saved_quant_config

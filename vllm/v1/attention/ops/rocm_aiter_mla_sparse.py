@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+import os
 from collections.abc import Callable
 from importlib.util import find_spec
 
@@ -41,6 +42,10 @@ def _get_aiter_topk_ops() -> tuple[Callable[..., None], Callable[..., None]] | N
 
 _GFX950_C4A_AITER_MAX_COMPRESSED_SEQ_LEN = 64 * 1024
 _GFX950_C4A_NATIVE_MAX_ROWS = 256
+_GLM53_GFX1151_AITER_MQA = os.environ.get(
+    "GLM53_GFX1151_AITER_MQA", "0"
+).lower() in ("1", "true")
+
 
 
 def _get_aiter_top_k_kernel(
@@ -632,7 +637,11 @@ def rocm_fp8_paged_mqa_logits(
     batch_size, next_n = q_fp8.shape[:2]
     block_size = kv_cache_fp8.shape[1]
 
-    if rocm_aiter_ops.is_enabled() or rocm_aiter_ops.is_rdna_aiter_enabled():
+    if (
+        rocm_aiter_ops.is_enabled()
+        or rocm_aiter_ops.is_rdna_aiter_enabled()
+        or _GLM53_GFX1151_AITER_MQA
+    ):
         aiter_paged_mqa_logits_module = paged_mqa_logits_module()
 
     if aiter_paged_mqa_logits_module is not None:
@@ -790,7 +799,11 @@ def rocm_fp8_mqa_logits(
         )
 
     aiter_mqa_logits_module = None
-    if rocm_aiter_ops.is_enabled() or rocm_aiter_ops.is_rdna_aiter_enabled():
+    if (
+        rocm_aiter_ops.is_enabled()
+        or rocm_aiter_ops.is_rdna_aiter_enabled()
+        or _GLM53_GFX1151_AITER_MQA
+    ):
         aiter_mqa_logits_module = mqa_logits_module()
 
     if aiter_mqa_logits_module is not None:

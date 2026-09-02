@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Source-only environment for GLM5.3 Flash CIRU STRIX UI4.
+#
+# This file intentionally has no `set`, argument parsing, or `exec`: the model
+# launcher sources it and retains ownership of its positional arguments.
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    printf 'source this file; do not execute it directly\n' >&2
+    exit 2
+fi
+
+: "${VLLM_SOURCE:?set VLLM_SOURCE to this pinned checkout}"
+: "${VLLM_VENV:?set VLLM_VENV to the ROCm 10 Python environment}"
+: "${AITER_SOURCE:?set AITER_SOURCE to the pinned Ciru AITER checkout}"
+
+python_bin="$VLLM_VENV/bin/python"
+[[ -x "$python_bin" ]] || {
+    printf 'Python is missing from VLLM_VENV: %s\n' "$python_bin" >&2
+    return 2
+}
+
+site_packages="$($python_bin - <<'PY'
+import site
+print(site.getsitepackages()[0])
+PY
+)"
+rocm_devel="${ROCM_DEVEL_ROOT:-$site_packages/_rocm_sdk_devel}"
+rocm_core="${ROCM_CORE_ROOT:-$site_packages/_rocm_sdk_core}"
+torch_lib="$site_packages/torch/lib"
+
+for required in \
+    "$VLLM_SOURCE/vllm/__init__.py" \
+    "$AITER_SOURCE/aiter/__init__.py" \
+    "$rocm_devel/lib" \
+    "$rocm_core/lib/llvm/amdgcn/bitcode" \
+    "$rocm_core/share/amd_smi" \
+    "$torch_lib"; do
+    [[ -e "$required" ]] || {
+        printf 'required runtime path is missing: %s\n' "$required" >&2
+        return 2
+    }
+done
+
+# CIRU_HOST_LIBRARY_PATH is the only distro-specific input.  A Nix wrapper
+# should derive it with lib.makeLibraryPath; Ubuntu/Debian normally leaves it
+# empty because libstdc++, glibc, and libnuma are in the system loader path.
+host_library_path="${CIRU_HOST_LIBRARY_PATH:-}"
+
+export PATH="$rocm_devel/bin:$rocm_devel/llvm/bin:$VLLM_VENV/bin:$PATH"
+export LD_LIBRARY_PATH="$torch_lib:$rocm_devel/lib:$rocm_devel/lib/rocm_sysdeps/lib${host_library_path:+:$host_library_path}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PYTHONPATH="$VLLM_SOURCE:$AITER_SOURCE:$rocm_core/share/amd_smi${PYTHONPATH:+:$PYTHONPATH}"
+export HIP_DEVICE_LIB_PATH="$rocm_core/lib/llvm/amdgcn/bitcode"
+export ROCM_PATH="$rocm_devel"
+export ROCM_HOME="$rocm_devel"
+export HIP_PATH="$rocm_devel"
+export CMAKE_PREFIX_PATH="$rocm_devel/lib/cmake:$site_packages/torch/share/cmake${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+
+export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
+export ROCR_VISIBLE_DEVICES="${ROCR_VISIBLE_DEVICES:-0}"
+export HIP_FORCE_DEV_KERNARG=1
+export PYTORCH_ROCM_ARCH=gfx1151
+export VLLM_TARGET_DEVICE=rocm
+export VLLM_ROCM_USE_AITER="${VLLM_ROCM_USE_AITER:-1}"
+export VLLM_ROCM_USE_AITER_MOE="${VLLM_ROCM_USE_AITER_MOE:-0}"
+export VLLM_ROCM_USE_SKINNY_GEMM="${VLLM_ROCM_USE_SKINNY_GEMM:-0}"
+export VLLM_ROCM_MOE_M1_DIRECT_ROUTE="${VLLM_ROCM_MOE_M1_DIRECT_ROUTE:-1}"
+export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+export VLLM_ENABLE_V1_MULTIPROCESSING="${VLLM_ENABLE_V1_MULTIPROCESSING:-0}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+export PYTHONHASHSEED="${PYTHONHASHSEED:-1}"
+
+unset CUDA_VISIBLE_DEVICES

@@ -87,11 +87,13 @@ def fused_moe_kernel_gptq_awq(
     stride_be,
     stride_bk,
     stride_bn,
+    stride_bnt,
     stride_cm,
     stride_cn,
     stride_bse,
     stride_bsk,
     stride_bsn,
+    stride_bsnt,
     stride_bze,
     stride_bzk,
     stride_bzn,
@@ -109,6 +111,7 @@ def fused_moe_kernel_gptq_awq(
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    use_native_n32_kword_layout: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -189,13 +192,26 @@ def fused_moe_kernel_gptq_awq(
     )
 
     if use_int4_w4a16:
-        b_ptrs = (
-            b_ptr
-            + off_experts * stride_be
-            + (offs_k[:, None] // 2) * stride_bk
-            + offs_bn[None, :] * stride_bn
-        )
-        b_shifter = (offs_k[:, None] % 2) * 4
+        if use_native_n32_kword_layout:
+            # Canonical gfx1151 layout shared with the native M=1 HIP path:
+            # [E, N // 32, K // 8, 32] int32.  Each word contains eight
+            # consecutive uint4b8 K values for one output lane.
+            b_ptrs = (
+                b_ptr
+                + off_experts * stride_be
+                + (offs_bn[None, :] // 32) * stride_bnt
+                + (offs_k[:, None] // 8) * stride_bk
+                + (offs_bn[None, :] % 32) * stride_bn
+            )
+            b_shifter = (offs_k[:, None] % 8) * 4
+        else:
+            b_ptrs = (
+                b_ptr
+                + off_experts * stride_be
+                + (offs_k[:, None] // 2) * stride_bk
+                + offs_bn[None, :] * stride_bn
+            )
+            b_shifter = (offs_k[:, None] % 2) * 4
     elif use_int8_w8a16:
         b_ptrs = (
             b_ptr
@@ -237,12 +253,24 @@ def fused_moe_kernel_gptq_awq(
         if use_int4_w4a16:
             b = (b >> b_shifter) & 0xF
 
-        b_scale_ptrs = (
-            b_scale_ptr
-            + off_experts * stride_bse
-            + offs_bn[None, :] * stride_bsn
-            + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
-        )
+        if use_native_n32_kword_layout:
+            # [E, N // 32, K // group_size, 32]
+            b_scale_ptrs = (
+                b_scale_ptr
+                + off_experts * stride_bse
+                + (offs_bn[None, :] // 32) * stride_bsnt
+                + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size)
+                * stride_bsk
+                + (offs_bn[None, :] % 32) * stride_bsn
+            )
+        else:
+            b_scale_ptrs = (
+                b_scale_ptr
+                + off_experts * stride_bse
+                + offs_bn[None, :] * stride_bsn
+                + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size)
+                * stride_bsk
+            )
         b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
         b_scale = b_scale.to(tl.float32)
 
@@ -278,7 +306,10 @@ def fused_moe_kernel_gptq_awq(
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
         if use_int4_w4a16:
-            b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
+            if use_native_n32_kword_layout:
+                b_ptrs += (BLOCK_SIZE_K // 8) * stride_bk
+            else:
+                b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
         else:
             b_ptrs += BLOCK_SIZE_K * stride_bk
 
@@ -687,10 +718,24 @@ def invoke_fused_moe_wna16_triton_kernel(
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
     block_shape: list[int] | None,
+    use_native_n32_kword_layout: bool = False,
 ):
-    assert B_scale is not None and B_scale.ndim == 3
-    assert B_zp is None or B_zp.ndim == 3
+    assert B_scale is not None
     assert block_shape is not None and block_shape[0] == 0
+    if use_native_n32_kword_layout:
+        assert use_int4_w4a16 and not use_int8_w8a16
+        assert B.dtype == torch.int32 and B.ndim == 4 and B.size(3) == 32
+        assert B_scale.ndim == 4 and B_scale.size(3) == 32
+        assert B_zp is None, "native N32/K-word layout supports symmetric G128 only"
+        assert B.size(0) == B_scale.size(0)
+        assert B.size(1) == B_scale.size(1)
+        assert B.size(2) * 8 == A.size(1)
+        assert B_scale.size(2) * block_shape[1] == A.size(1)
+        size_n = B.size(1) * 32
+    else:
+        assert B.ndim == 3 and B_scale.ndim == 3
+        assert B_zp is None or B_zp.ndim == 3
+        size_n = B.size(1)
 
     M = A.size(0)
     num_tokens = M * top_k
@@ -704,7 +749,7 @@ def invoke_fused_moe_wna16_triton_kernel(
         EM = min(sorted_token_ids.size(0), A.size(0) * top_k * config["BLOCK_SIZE_M"])
     grid = lambda META: (
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
-        * triton.cdiv(B.size(1), META["BLOCK_SIZE_N"]),
+        * triton.cdiv(size_n, META["BLOCK_SIZE_N"]),
     )
     config = config.copy()
     config.update(
@@ -713,8 +758,8 @@ def invoke_fused_moe_wna16_triton_kernel(
             use_moe_wna16_cuda=False,
             num_valid_tokens=num_tokens,
             size_k=A.size(1),
-            size_n=B.size(1),
-            num_experts=B.size(1),
+            size_n=size_n,
+            num_experts=B.size(0) if use_native_n32_kword_layout else B.size(1),
             group_size=block_shape[1],
             real_top_k=top_k,
             block_size_m=config["BLOCK_SIZE_M"],
@@ -731,7 +776,7 @@ def invoke_fused_moe_wna16_triton_kernel(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
-        B.size(1),
+        size_n,
         A.size(1),
         EM,
         num_tokens,
@@ -739,12 +784,14 @@ def invoke_fused_moe_wna16_triton_kernel(
         A.stride(1),
         B.stride(0),
         B.stride(2),
-        B.stride(1),
+        B.stride(3) if use_native_n32_kword_layout else B.stride(1),
+        B.stride(1) if use_native_n32_kword_layout else 0,
         C.stride(1),
         C.stride(2),
         B_scale.stride(0),
         B_scale.stride(2),
-        B_scale.stride(1),
+        B_scale.stride(3) if use_native_n32_kword_layout else B_scale.stride(1),
+        B_scale.stride(1) if use_native_n32_kword_layout else 0,
         B_zp.stride(0) if B_zp is not None else 0,
         B_zp.stride(2) if B_zp is not None else 0,
         B_zp.stride(1) if B_zp is not None else 0,
@@ -756,6 +803,7 @@ def invoke_fused_moe_wna16_triton_kernel(
         has_zp=B_zp is not None,
         use_int4_w4a16=use_int4_w4a16,
         use_int8_w8a16=use_int8_w8a16,
+        use_native_n32_kword_layout=use_native_n32_kword_layout,
         **config,
     )
 

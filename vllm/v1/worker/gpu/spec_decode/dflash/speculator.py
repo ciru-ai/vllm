@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -107,16 +108,25 @@ class DFlashSpeculator(DraftModelSpeculator):
         config = copy.copy(super().attn_vllm_config)
         config.attention_config = replace(
             self.vllm_config.attention_config,
+            backend=self.speculative_config.attention_backend,
             use_non_causal=self.requires_non_causal,
         )
         return config
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        force_eager = os.environ.get("VLLM_DFLASH_CUDAGRAPH", "1") == "0"
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
         supports_full = (
             self.attn_cg_support.min_cg_support.value
             >= AttentionCGSupport.UNIFORM_BATCH.value
         )
+        if force_eager:
+            logger.info(
+                "%s CUDA graph disabled by VLLM_DFLASH_CUDAGRAPH=0; "
+                "retaining target-model graph mode.",
+                self._speculator_name,
+            )
+            wants_full = False
         if wants_full and not supports_full:
             logger.warning(
                 "%s draft attention (%s) does not support full CUDA graphs; "

@@ -623,7 +623,12 @@ class GPUModelRunner(
         # Encoder CUDA graph manager (initialized after model load if enabled)
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
 
-        self.use_aux_hidden_state_outputs = False
+        # DFlash target features can span PP stages.  Every stage must enable
+        # the target's aux-state taps so earlier-stage features can ride the
+        # normal IntermediateTensors transfer to the last-rank drafter.
+        self.use_aux_hidden_state_outputs = bool(
+            self.speculative_config and self.speculative_config.use_dflash()
+        )
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -4531,8 +4536,10 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
-            if self.use_aux_hidden_state_outputs:
-                # True when EAGLE 3 is used.
+            if self.use_aux_hidden_state_outputs and get_pp_group().is_last_rank:
+                # The last PP rank receives any upstream aux features and
+                # returns the complete ordered feature list. Earlier ranks
+                # pack their local features into IntermediateTensors instead.
                 hidden_states, aux_hidden_states = model_output
             else:
                 # Common case.

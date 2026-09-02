@@ -249,6 +249,8 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
     # Checkpoints are serialized in compressed-tensors format, which is
     # different from the format the kernel may want. Handle repacking here.
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "_vllm_runtime_prepacked", False):
+            return
         self.kernel.process_weights_after_loading(layer)
 
     def apply_weights(

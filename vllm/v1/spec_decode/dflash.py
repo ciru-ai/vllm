@@ -10,6 +10,7 @@ from typing_extensions import override
 from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
+from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.spec_decode.utils import (
@@ -35,6 +36,11 @@ class DFlashProposer(SpecDecodeBaseProposer):
             pass_hidden_states_to_model=True,
             runner=runner,
         )
+
+        self.is_dflash2 = "DFlash2DraftModel" in (
+            self.draft_model_config.architectures or []
+        )
+        self._dflash_anchor_token_ids: torch.Tensor | None = None
 
         # Only next_token_ids and mask tokens are query tokens, all other context is K/V
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
@@ -117,6 +123,110 @@ class DFlashProposer(SpecDecodeBaseProposer):
         pass
 
     @override
+    def _maybe_share_embeddings(self, target_language_model: torch.nn.Module) -> None:
+        if not self.is_dflash2:
+            return super()._maybe_share_embeddings(target_language_model)
+
+        # DFlash2 ships neither embed_tokens nor lm_head.  In PP the generic
+        # proposer deliberately skips embedding sharing because ordinary last
+        # ranks do not own the target embedding.  GLM retains a real target
+        # embedding on the last rank for this path, so share it explicitly.
+        target_inner = getattr(target_language_model, "model", None)
+        target_embed = getattr(target_inner, "embed_tokens", None)
+        if target_embed is None or not hasattr(target_embed, "weight"):
+            raise RuntimeError(
+                "DFlash2 on PP requires a target token embedding on the last rank"
+            )
+        self.model.model.embed_tokens = target_embed
+        logger.info("Sharing last-rank GLM target embeddings with DFlash2.")
+
+    @override
+    def _sample_draft_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if not self.is_dflash2:
+            return super()._sample_draft_tokens(hidden_states, sampling_metadata)
+
+        anchor_token_ids = self._dflash_anchor_token_ids
+        assert anchor_token_ids is not None
+        batch_size = anchor_token_ids.numel()
+        num_steps = self.num_speculative_tokens
+        assert hidden_states.shape[0] == batch_size * num_steps
+
+        model = self.model
+        if not hasattr(model, "compute_candidates") and hasattr(model, "unwrap"):
+            model = model.unwrap()
+        candidate_ids, unary_logits = model.compute_candidates(hidden_states)
+        top_k = candidate_ids.shape[-1]
+        candidate_ids = candidate_ids.view(batch_size, num_steps, top_k)
+        unary_logits = unary_logits.view_as(candidate_ids)
+        path_hidden = hidden_states.view(batch_size, num_steps, -1)
+        scores = model.model.candidate_selector(
+            candidate_ids,
+            unary_logits,
+            path_hidden,
+            anchor_token_ids,
+        )
+
+        rows = torch.arange(batch_size, device=hidden_states.device)
+        predecessor = torch.zeros(
+            batch_size, dtype=torch.long, device=hidden_states.device
+        )
+        path: list[torch.Tensor] = []
+        full_probs: torch.Tensor | None = None
+        temperature = sampling_metadata.temperature
+        if not sampling_metadata.all_greedy:
+            assert temperature is not None
+            temperature = temperature[:batch_size]
+            full_probs = torch.zeros(
+                batch_size,
+                num_steps,
+                int(self.draft_model_config.hf_config.vocab_size),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+
+        for step in range(num_steps):
+            step_scores = scores[rows, step, predecessor].float()
+            greedy_index = step_scores.argmax(dim=-1)
+            if sampling_metadata.all_greedy:
+                selected = greedy_index
+            else:
+                assert temperature is not None and full_probs is not None
+                greedy_rows = temperature < 1e-5
+                safe_temperature = torch.where(
+                    greedy_rows, torch.ones_like(temperature), temperature
+                )
+                probs = torch.softmax(
+                    step_scores / safe_temperature[:, None], dim=-1
+                )
+                noise = torch.empty_like(probs).exponential_()
+                random_index = (probs / noise).argmax(dim=-1)
+                selected = torch.where(greedy_rows, greedy_index, random_index)
+                if greedy_rows.any():
+                    probs = torch.where(
+                        greedy_rows[:, None],
+                        torch.nn.functional.one_hot(
+                            greedy_index, num_classes=top_k
+                        ).to(probs.dtype),
+                        probs,
+                    )
+                full_probs[:, step].scatter_(
+                    1, candidate_ids[:, step].long(), probs
+                )
+
+            path.append(candidate_ids[rows, step, selected])
+            predecessor = selected
+
+        draft_token_ids = torch.stack(path, dim=1).reshape(-1)
+        draft_probs = (
+            None if full_probs is None else full_probs.flatten(0, 1).contiguous()
+        )
+        return draft_token_ids, draft_probs
+
+    @override
     def set_inputs_first_pass(
         self,
         target_token_ids: torch.Tensor,
@@ -133,6 +243,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         num_context = target_token_ids.shape[0]
         num_query_per_req = 1 + self.num_speculative_tokens
         num_query_total = batch_size * num_query_per_req
+        self._dflash_anchor_token_ids = next_token_ids.view(-1)[:batch_size]
 
         # Store for build_model_inputs_first_pass to use
         self._dflash_num_context = num_context

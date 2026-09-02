@@ -210,6 +210,8 @@ class RoutedExperts(PluggableLayer):
         return quant_method.__class__.__name__ in (
             "AutoGPTQMoEMethod",
             "CompressedTensorsWNA16MoEMethod",
+            "Glm53Iu4M1MoEMethod",
+            "Glm53Iu4CanonicalMoEMethod",
             "CompressedTensorsW4A16FlydslMoEMethod",
         )
 
@@ -657,6 +659,8 @@ class RoutedExperts(PluggableLayer):
         if quant_method_name in (
             "CompressedTensorsWNA16MoEMethod",
             "CompressedTensorsWNA16RDNA3MoEMethod",
+            "Glm53Iu4M1MoEMethod",
+            "Glm53Iu4CanonicalMoEMethod",
             "CompressedTensorsW4A16FlydslMoEMethod",
         ):
             if is_transposed:

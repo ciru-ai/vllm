@@ -464,6 +464,10 @@ class ComputeSlotMappingKernel(VllmJitKernel["ComputeSlotMappingKernel.CompileKe
                 virtual_block_indices * BLOCKS_PER_KV_BLOCK
                 + local_block_offsets // block_size
             )
+            # KpoolTailSpec is a one-block circular scratch cache. Clamp the
+            # generic paged index to the actual row width so long positions
+            # keep using entry 0 instead of reading a garbage block id.
+            block_indices = tl.minimum(block_indices, block_table_stride - 1)
             block_numbers = tl.load(
                 block_table_ptr + row_offset + block_indices,
                 mask=mask & is_local,

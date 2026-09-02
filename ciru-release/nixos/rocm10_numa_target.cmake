@@ -1,0 +1,5 @@
+if(NOT TARGET numa::numa)
+  find_library(NUMA_LIBRARY NAMES numa REQUIRED)
+  add_library(numa::numa UNKNOWN IMPORTED)
+  set_target_properties(numa::numa PROPERTIES IMPORTED_LOCATION "${NUMA_LIBRARY}")
+endif()

@@ -2,11 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import time
+
 import torch
+import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 from vllm.distributed.device_communicators.all_reduce_utils import (
     NCCL_SYMM_MEM_ALL_REDUCE_CONFIG,
     should_nccl_symm_mem_ag_rs,
@@ -98,6 +102,102 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
+        self.nhi_ar_comm = None
+
+        nhi_modes_enabled = sum(
+            (
+                envs.VLLM_NHI_ALLREDUCE,
+                envs.VLLM_NHI_M4_ALLREDUCE,
+                envs.VLLM_NHI_M8_ALLREDUCE,
+                envs.VLLM_NHI_PP768_ALLREDUCE,
+            )
+        )
+        if nhi_modes_enabled > 1:
+            raise ValueError(
+                "VLLM_NHI_ALLREDUCE, VLLM_NHI_M4_ALLREDUCE, "
+                "VLLM_NHI_M8_ALLREDUCE, and VLLM_NHI_PP768_ALLREDUCE "
+                "are mutually exclusive"
+            )
+
+        if (
+            nhi_modes_enabled
+            and current_platform.is_rocm()
+            and self.world_size == 2
+            and unique_name.split(":")[0] == "tp"
+        ):
+            if envs.VLLM_NHI_PP768_ALLREDUCE:
+                from .nhi_all_reduce_pp768 import (
+                    NhiAllReducePP768 as NhiAllReduce,
+                )
+
+                nhi_library = envs.VLLM_NHI_PP768_LIBRARY
+                nhi_mode = "PP768"
+            elif envs.VLLM_NHI_M8_ALLREDUCE:
+                from .nhi_all_reduce_m8 import NhiAllReduceM8 as NhiAllReduce
+
+                nhi_library = envs.VLLM_NHI_M8_LIBRARY
+                nhi_mode = "M8"
+            elif envs.VLLM_NHI_M4_ALLREDUCE:
+                from .nhi_all_reduce_m4 import NhiAllReduceM4 as NhiAllReduce
+
+                nhi_library = envs.VLLM_NHI_M4_LIBRARY
+                nhi_mode = "M4"
+            else:
+                from .nhi_all_reduce import NhiAllReduce
+
+                nhi_library = envs.VLLM_NHI_LIBRARY
+                nhi_mode = "M1"
+
+            # All ranks must use one nonzero session epoch. Open can fail on
+            # only one host (permissions/device state), so reduce the local
+            # result before either rank enters the post-open barrier.
+            epoch_tensor = torch.zeros(1, dtype=torch.int64)
+            if self.rank_in_group == 0:
+                epoch_tensor[0] = (time.time_ns() & ((1 << 63) - 1)) or 1
+            dist.broadcast(
+                epoch_tensor,
+                src=self.ranks[0],
+                group=self.cpu_group,
+            )
+            local_error = ""
+            candidate = None
+            try:
+                gpu_index = (
+                    self.device.index
+                    if self.device.index is not None
+                    else torch.cuda.current_device()
+                )
+                candidate = NhiAllReduce(
+                    library_path=nhi_library,
+                    device_path=envs.VLLM_NHI_DEVICE,
+                    gpu_index=gpu_index,
+                    rank=self.rank_in_group,
+                    epoch=int(epoch_tensor.item()),
+                    timeout_ms=envs.VLLM_NHI_TIMEOUT_MS,
+                )
+            except Exception as exc:
+                local_error = f"rank {self.rank_in_group}: {exc}"
+
+            open_ok = torch.tensor([not local_error], dtype=torch.int32)
+            dist.all_reduce(open_ok, op=dist.ReduceOp.MIN, group=self.cpu_group)
+            if not bool(open_ok.item()):
+                if candidate is not None:
+                    candidate.close()
+                errors: list[str | None] = [None] * self.world_size
+                dist.all_gather_object(errors, local_error, group=self.cpu_group)
+                raise RuntimeError(
+                    "direct NHI initialization failed: "
+                    + "; ".join(error for error in errors if error)
+                )
+            assert candidate is not None
+            dist.barrier(group=self.cpu_group)
+            self.nhi_ar_comm = candidate
+            logger.info(
+                "Direct NHI %s all-reduce enabled for group '%s' on %s.",
+                nhi_mode,
+                unique_name,
+                envs.VLLM_NHI_DEVICE,
+            )
 
         if use_torch_symm_mem and current_platform.is_cuda():
             self.symm_mem_comm = SymmMemCommunicator(
@@ -220,6 +320,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         depends on the input tensor.
         """
         all_potential_ar_backends = [
+            "NHI",
             "FLASHINFER",
             "NCCL_SYMM_MEM",
             "QUICK_REDUCE",
@@ -229,6 +330,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "PYNCCL",
         ]
         enabled_ar_backends: list[str] = []
+        if self.nhi_ar_comm is not None and not self.nhi_ar_comm.disabled:
+            enabled_ar_backends.append("NHI")
         if self.fi_ar_comm is not None and not self.fi_ar_comm.disabled:
             enabled_ar_backends.append("FLASHINFER")
         # Mirror the static preconditions of `should_nccl_symm_mem_allreduce`:
@@ -276,6 +379,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        nhi_ar_comm = self.nhi_ar_comm
+        if (
+            nhi_ar_comm is not None
+            and not nhi_ar_comm.disabled
+            and nhi_ar_comm.matches_nhi_ar(input_)
+        ):
+            if BreakableCUDAGraphCapture.is_active():
+                return nhi_ar_comm.all_reduce_breakable(input_)
+            if not nhi_ar_comm.should_use_nhi_ar(input_):
+                raise RuntimeError(
+                    "direct NHI requires breakable cudagraph during capture"
+                )
+            return nhi_ar_comm.all_reduce(input_)
+
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (
             fi_ar_comm is not None
@@ -583,6 +700,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("No PyNCCL communicator found")
 
     def destroy(self):
+        if self.nhi_ar_comm is not None:
+            self.nhi_ar_comm.close()
+            self.nhi_ar_comm = None
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None

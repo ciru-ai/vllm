@@ -51,6 +51,8 @@ class LoadConfig:
       files using Run:ai Model Streamer.
     - "sharded_state" will load weights from pre-sharded checkpoint files,
       supporting efficient loading of tensor-parallel models.
+    - "glm53_runtime_prepack" will load versioned per-rank GLM-5.3 tensors
+      already stored in their final runtime layouts.
     - "mistral" will load weights from consolidated safetensors files used by
       Mistral models.
     - "modelexpress" will load weights using ModelExpress.

@@ -3,7 +3,7 @@
 import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.model_executor.model_loader import get_model
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     _should_share,
@@ -11,11 +11,21 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
 )
 
 
+def _copy_full_vocab_weight(local_layer: nn.Module, target_layer: nn.Module) -> None:
+    full_weight = get_tp_group().all_gather(target_layer.weight.data, dim=0)
+    mapping = target_layer.get_sharded_to_full_mapping()
+    if mapping is not None:
+        full_weight = full_weight[mapping]
+    local_layer.weight.data.copy_(full_weight[: local_layer.weight.shape[0]])
+    del full_weight
+
+
 def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
     from vllm.compilation.backends import set_model_tag
     from vllm.model_executor.models.qwen3_dflash import (
         dflash_has_any_non_causal,
         dflash_target_rope_is_neox_style,
+        dflash_uses_local_tp,
     )
 
     speculative_config = vllm_config.speculative_config
@@ -46,7 +56,9 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     )
     with set_model_tag("dflash_head"):
         dflash_model = get_model(
-            vllm_config=draft_vllm_config, model_config=draft_model_config
+            vllm_config=draft_vllm_config,
+            model_config=draft_model_config,
+            load_config=speculative_config.draft_load_config,
         )
 
     target_language_model = (
@@ -59,6 +71,7 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     # no .model of its own.
     target_inner = getattr(target_language_model, "model", target_language_model)
     draft_inner = dflash_model.model
+    local_draft_tp = dflash_uses_local_tp(vllm_config)
 
     # Skip embedding sharing under PP — each rank owns its own embedding.
     if get_pp_group().world_size == 1:
@@ -66,7 +79,14 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             target_inner, "embedding", None
         )
         draft_embed = getattr(draft_inner, "embed_tokens", None)
-        if target_embed is not None and _should_share(
+        if (
+            local_draft_tp
+            and target_embed is not None
+            and draft_embed is not None
+            and not getattr(dflash_model, "has_own_embed_tokens", False)
+        ):
+            _copy_full_vocab_weight(draft_embed, target_embed)
+        elif target_embed is not None and _should_share(
             dflash_model, "has_own_embed_tokens", draft_embed, target_embed
         ):
             if draft_embed is not None:
@@ -75,7 +95,14 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(dflash_model, "lm_head", None)
-    if target_lm_head is not None and _should_share(
+    if (
+        local_draft_tp
+        and target_lm_head is not None
+        and draft_lm_head is not None
+        and not getattr(dflash_model, "has_own_lm_head", False)
+    ):
+        _copy_full_vocab_weight(draft_lm_head, target_lm_head)
+    elif target_lm_head is not None and _should_share(
         dflash_model, "has_own_lm_head", draft_lm_head, target_lm_head
     ):
         if draft_lm_head is not None:

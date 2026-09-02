@@ -2,6 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton-based MoE expert implementations."""
 
+from collections.abc import Callable
+import math
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -56,9 +60,218 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt8StaticChannelSym,
     kInt8StaticTensorSym,
 )
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+
+
+logger = init_logger(__name__)
+
+_ENABLE_GLM_M1_DIRECT_ROUTE = os.getenv(
+    "VLLM_ROCM_MOE_M1_DIRECT_ROUTE", "0"
+).lower() not in {"0", "false", "no"}
+_ENABLE_GLM_M8_SINGLE_LAUNCH_ALIGN = os.getenv(
+    "VLLM_GLM53_M8_SINGLE_LAUNCH_ALIGN_ENABLED", "0"
+).lower() not in {"0", "false", "no"}
+_GLM_M8_SINGLE_LAUNCH_ALIGN_LIBRARY = os.getenv(
+    "VLLM_GLM53_M8_SINGLE_LAUNCH_ALIGN_LIBRARY", ""
+)
+_GLM_M8_SINGLE_LAUNCH_ALIGN_LIBRARY_LOADED = False
+_ENABLE_GLM_NATIVE_N32_KWORD_LAYOUT = os.getenv(
+    "VLLM_ROCM_MOE_NATIVE_N32_KWORD_LAYOUT", "0"
+).lower() not in {"0", "false", "no"}
+_ENABLE_GLM_RESIDENT_G128 = os.getenv(
+    "VLLM_GLM53_RESIDENT_G128_ENABLED", "0"
+).lower() not in {"0", "false", "no"}
+_GLM_RESIDENT_G128_LIBRARY = os.getenv(
+    "VLLM_GLM53_RESIDENT_G128_LIBRARY", ""
+)
+_GLM_RESIDENT_G128_LIBRARY_LOADED = False
+_ENABLE_GLM_M4_RESIDUAL_DOT8 = os.getenv(
+    "VLLM_GLM53_M4_RESIDUAL_DOT8_ENABLED", "0"
+).lower() not in {"0", "false", "no"}
+_GLM_M4_RESIDUAL_DOT8_LIBRARY = os.getenv(
+    "VLLM_GLM53_M4_RESIDUAL_DOT8_LIBRARY", ""
+)
+_GLM_M4_RESIDUAL_DOT8_LIBRARY_LOADED = False
+_ENABLE_GLM_M8_RESIDUAL_DOT8 = os.getenv(
+    "VLLM_GLM53_M8_RESIDUAL_DOT8_ENABLED", "0"
+).lower() not in {"0", "false", "no"}
+_GLM_M8_RESIDUAL_DOT8_LIBRARY = os.getenv(
+    "VLLM_GLM53_M8_RESIDUAL_DOT8_LIBRARY", ""
+)
+_GLM_M8_RESIDUAL_DOT8_LIBRARY_LOADED = False
+_ENABLE_GLM_EXL3_K3_DUAL20 = os.getenv(
+    "VLLM_GLM53_EXL3_K3_DUAL20_ENABLED", "0"
+).lower() not in {"0", "false", "no"}
+_GLM_EXL3_K3_DUAL20_LIBRARY = os.getenv(
+    "VLLM_GLM53_EXL3_K3_DUAL20_LIBRARY", ""
+)
+_GLM_EXL3_K3_DUAL20_PACKET_ROOT = os.getenv(
+    "VLLM_GLM53_EXL3_K3_DUAL20_PACKET_ROOT", ""
+)
+_GLM_EXL3_K3_DUAL20_LAYERS = frozenset(
+    int(value)
+    for value in os.getenv(
+        "VLLM_GLM53_EXL3_K3_DUAL20_LAYERS",
+        "3,6,9,12,15,18,21,23,24,25,27,30,33,34,35,37,39,42,43,44",
+    ).split(",")
+    if value
+)
+_GLM_EXL3_K3_DUAL20_LIBRARY_LOADED = False
+_GLM_EXL3_K3_NEXT_LAYER = 3
+
+
+def _load_glm_m8_single_launch_align_library() -> None:
+    global _GLM_M8_SINGLE_LAUNCH_ALIGN_LIBRARY_LOADED
+    if _GLM_M8_SINGLE_LAUNCH_ALIGN_LIBRARY_LOADED:
+        return
+    if not _GLM_M8_SINGLE_LAUNCH_ALIGN_LIBRARY:
+        raise RuntimeError(
+            "VLLM_GLM53_M8_SINGLE_LAUNCH_ALIGN_LIBRARY is required"
+        )
+    torch.ops.load_library(_GLM_M8_SINGLE_LAUNCH_ALIGN_LIBRARY)
+    try:
+        torch.ops.glm53_m8_align.align
+    except (AttributeError, RuntimeError) as exc:
+        raise RuntimeError(
+            "M8 alignment library did not register glm53_m8_align::align"
+        ) from exc
+    _GLM_M8_SINGLE_LAUNCH_ALIGN_LIBRARY_LOADED = True
+
+
+def _load_glm_resident_g128_library() -> None:
+    global _GLM_RESIDENT_G128_LIBRARY_LOADED
+    if _GLM_RESIDENT_G128_LIBRARY_LOADED:
+        return
+    if not _GLM_RESIDENT_G128_LIBRARY:
+        raise RuntimeError(
+            "VLLM_GLM53_RESIDENT_G128_LIBRARY is required when the resident "
+            "G128 MoE path is enabled"
+        )
+    torch.ops.load_library(_GLM_RESIDENT_G128_LIBRARY)
+    try:
+        torch.ops.glm53_resident_hybrid_g128.moe_out
+    except AttributeError as exc:
+        raise RuntimeError(
+            "Resident G128 library did not register "
+            "glm53_resident_hybrid_g128::moe_out"
+        ) from exc
+    _GLM_RESIDENT_G128_LIBRARY_LOADED = True
+
+
+def _load_glm_m4_residual_dot8_library() -> None:
+    global _GLM_M4_RESIDUAL_DOT8_LIBRARY_LOADED
+    if _GLM_M4_RESIDUAL_DOT8_LIBRARY_LOADED:
+        return
+    if not _GLM_M4_RESIDUAL_DOT8_LIBRARY:
+        raise RuntimeError(
+            "VLLM_GLM53_M4_RESIDUAL_DOT8_LIBRARY is required when the M4 "
+            "residual-dot8 MoE path is enabled"
+        )
+    torch.ops.load_library(_GLM_M4_RESIDUAL_DOT8_LIBRARY)
+    try:
+        torch.ops.glm53_m4_residual_dot8.moe_out
+    except AttributeError as exc:
+        raise RuntimeError(
+            "M4 residual-dot8 library did not register "
+            "glm53_m4_residual_dot8::moe_out"
+        ) from exc
+    _GLM_M4_RESIDUAL_DOT8_LIBRARY_LOADED = True
+
+
+def _load_glm_m8_residual_dot8_library() -> None:
+    global _GLM_M8_RESIDUAL_DOT8_LIBRARY_LOADED
+    if _GLM_M8_RESIDUAL_DOT8_LIBRARY_LOADED:
+        return
+    if not _GLM_M8_RESIDUAL_DOT8_LIBRARY:
+        raise RuntimeError(
+            "VLLM_GLM53_M8_RESIDUAL_DOT8_LIBRARY is required when the M8 "
+            "residual-dot8 MoE path is enabled"
+        )
+    torch.ops.load_library(_GLM_M8_RESIDUAL_DOT8_LIBRARY)
+    try:
+        torch.ops.glm53_m8_residual_dot8.moe_out
+    except AttributeError as exc:
+        raise RuntimeError(
+            "M8 residual-dot8 library did not register "
+            "glm53_m8_residual_dot8::moe_out"
+        ) from exc
+    _GLM_M8_RESIDUAL_DOT8_LIBRARY_LOADED = True
+
+
+def _load_glm_exl3_k3_dual20_library() -> None:
+    global _GLM_EXL3_K3_DUAL20_LIBRARY_LOADED
+    if _GLM_EXL3_K3_DUAL20_LIBRARY_LOADED:
+        return
+    if not _GLM_EXL3_K3_DUAL20_LIBRARY:
+        raise RuntimeError(
+            "VLLM_GLM53_EXL3_K3_DUAL20_LIBRARY is required when K3 is enabled"
+        )
+    torch.ops.load_library(_GLM_EXL3_K3_DUAL20_LIBRARY)
+    try:
+        torch.ops.glm53_exl3_mcg_k3_dual20_m8.moe_out
+    except AttributeError as exc:
+        raise RuntimeError(
+            "K3 library did not register "
+            "glm53_exl3_mcg_k3_dual20_m8::moe_out"
+        ) from exc
+    _GLM_EXL3_K3_DUAL20_LIBRARY_LOADED = True
+
+
+def _glm_exl3_k3_layer_for_instance(instance) -> int:
+    layer = getattr(instance, "_glm53_exl3_k3_layer", None)
+    if layer is not None:
+        return layer
+    global _GLM_EXL3_K3_NEXT_LAYER
+    layer = _GLM_EXL3_K3_NEXT_LAYER
+    _GLM_EXL3_K3_NEXT_LAYER += 1
+    instance._glm53_exl3_k3_layer = layer
+    return layer
+
+
+def _load_glm_exl3_k3_packet(instance, layer: int, device: torch.device):
+    retained = getattr(instance, "_glm53_exl3_k3_packet", None)
+    if retained is not None:
+        return retained
+    if not _GLM_EXL3_K3_DUAL20_PACKET_ROOT:
+        raise RuntimeError(
+            "VLLM_GLM53_EXL3_K3_DUAL20_PACKET_ROOT is required when K3 is enabled"
+        )
+    from safetensors import safe_open
+
+    rank = int(os.getenv("RANK", "0"))
+    packet_path = os.path.join(
+        _GLM_EXL3_K3_DUAL20_PACKET_ROOT,
+        f"rank{rank}-layer{layer}-mcg-k3.safetensors",
+    )
+    names = (
+        "w13.trellis",
+        "w13.suh",
+        "w13.svh",
+        "w2.trellis",
+        "w2.suh",
+        "w2.svh",
+    )
+    with safe_open(packet_path, framework="pt", device=str(device)) as handle:
+        weights = tuple(handle.get_tensor(name).contiguous() for name in names)
+    scratch = (
+        torch.empty((64,), dtype=torch.int32, device=device),
+        torch.empty((64, 4096), dtype=torch.float16, device=device),
+        torch.empty((64, 2048), dtype=torch.float16, device=device),
+        torch.empty((64, 1024), dtype=torch.float16, device=device),
+        torch.empty((64, 1024), dtype=torch.float16, device=device),
+        torch.empty((64, 4096), dtype=torch.float16, device=device),
+    )
+    retained = (weights, scratch)
+    instance._glm53_exl3_k3_packet = retained
+    logger.info_once(
+        "Loaded the GLM EXL3 MCG K3 M8 packet for rank %d layer %d.",
+        rank,
+        layer,
+    )
+    return retained
 
 
 class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
@@ -98,6 +311,9 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         # higher-precision + activation QDQ.
         self.quantization_emulation = False
         super().__init__(moe_config, quant_config)
+        self._moe_sum_override: (
+            Callable[[torch.Tensor, torch.Tensor], bool] | None
+        ) = None
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -562,7 +778,18 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         # separate function is required for MoE + LoRA
         self.moe_sum(intermediate_cache3, output)
 
+    def set_moe_sum_override(
+        self,
+        override: Callable[[torch.Tensor, torch.Tensor], bool] | None,
+    ) -> None:
+        """Install an instance-scoped reducer that returns true when handled."""
+        self._moe_sum_override = override
+
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
+        if self._moe_sum_override is not None and self._moe_sum_override(
+            input, output
+        ):
+            return
         ops.moe_sum(input, output)
 
 
@@ -612,6 +839,27 @@ class TritonWNA16Experts(TritonExperts):
             or moe_parallel_config.use_fi_nvl_one_sided_kernels
         )
 
+    def moe_problem_size(
+        self,
+        a1: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[int, int, int, int, int]:
+        if (
+            _ENABLE_GLM_NATIVE_N32_KWORD_LAYOUT
+            and self.quant_config.use_int4_w4a16
+            and w1.ndim == 4
+            and w2.ndim == 4
+        ):
+            E = w1.size(0)
+            N = w1.size(1) * 32
+            K = a1.size(-1)
+            assert a1.dim() == 2 and topk_ids.size(0) == a1.size(0)
+            assert topk_ids.dim() == 2
+            return E, a1.size(0), N, K, topk_ids.size(1)
+        return super().moe_problem_size(a1, w1, w2, topk_ids)
+
     def apply(
         self,
         output: torch.Tensor,
@@ -631,7 +879,35 @@ class TritonWNA16Experts(TritonExperts):
         apply_router_weight_on_input: bool,
     ):
         # Check constraints.
-        if self.quant_config.use_int4_w4a16:
+        use_native_n32_kword_layout = (
+            _ENABLE_GLM_NATIVE_N32_KWORD_LAYOUT
+            and self.quant_config.use_int4_w4a16
+            and w1.ndim == 4
+            and w2.ndim == 4
+            and self.w1_scale.ndim == 4
+            and self.w2_scale.ndim == 4
+        )
+        if use_native_n32_kword_layout:
+            assert self.quant_config.w1_zp is None
+            assert self.quant_config.w2_zp is None
+            assert tuple(self.block_shape or ()) == (0, 128)
+            assert w1.dtype == torch.int32 and w2.dtype == torch.int32
+            assert w1.size(3) == 32 and w2.size(3) == 32
+            assert self.w1_scale.size(3) == 32
+            assert self.w2_scale.size(3) == 32
+            assert hidden_states.size(-1) == w1.size(2) * 8
+            assert w2.size(1) * 32 == hidden_states.size(-1)
+            assert w1.size(0) == w2.size(0)
+            E = w1.size(0)
+            num_tokens = hidden_states.size(0)
+            N = w1.size(1) * 32
+            K = hidden_states.size(-1)
+            top_k_num = topk_ids.size(1)
+            config_w1_size = torch.Size((E, N, w1.size(2) * 4))
+            config_w2_size = torch.Size(
+                (E, w2.size(1) * 32, w2.size(2) * 4)
+            )
+        elif self.quant_config.use_int4_w4a16:
             assert hidden_states.size(-1) // 2 == w1.size(2), (
                 f"Hidden size mismatch {hidden_states.size(-1) // 2} == {w1.size(2)}"
             )
@@ -652,21 +928,28 @@ class TritonWNA16Experts(TritonExperts):
             torch.float8_e4m3fnuz,
         ]
 
-        E, num_tokens, N, K, top_k_num = self.moe_problem_size(
-            hidden_states, w1, w2, topk_ids
-        )
+        if not use_native_n32_kword_layout:
+            E, num_tokens, N, K, top_k_num = self.moe_problem_size(
+                hidden_states, w1, w2, topk_ids
+            )
+            config_w1_size = w1.size()
+            config_w2_size = w2.size()
 
         if global_num_experts == -1:
             global_num_experts = E
 
         config = try_get_optimal_moe_config(
-            w1.size(),
-            w2.size(),
+            config_w1_size,
+            config_w2_size,
             top_k_num,
             self.quant_config.config_name(hidden_states.dtype),
             num_tokens,
             block_shape=self.block_shape,
         )
+        if use_native_n32_kword_layout:
+            logger.info_once(
+                "Using canonical N32/K-word G128 weights in Triton W4A16 MoE."
+            )
 
         if hidden_states.dtype == torch.bfloat16:
             compute_type = tl.bfloat16
@@ -690,11 +973,445 @@ class TritonWNA16Experts(TritonExperts):
         )
         intermediate_cache3 = _resize_cache(workspace2, (num_tokens, top_k_num, K))
 
-        # Include fused shared-expert rows while preserving EP remapping.
-        num_align_experts = w1.shape[0] if expert_map is None else global_num_experts
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, config["BLOCK_SIZE_M"], num_align_experts, expert_map
+        k3_target_shape = (
+            _ENABLE_GLM_EXL3_K3_DUAL20
+            and use_native_n32_kword_layout
+            and E == 288
+            and N == 2048
+            and K == 4096
+            and top_k_num == 8
+            and hidden_states.dtype == torch.bfloat16
+            and topk_ids.dtype == torch.int32
+            and topk_weights.dtype == torch.float32
+            and tuple(w1.shape[1:]) == (64, 512, 32)
+            and tuple(w2.shape[1:]) == (128, 128, 32)
+            and activation == MoEActivation.SILU
+            and self.activation_config.clamp_limit == 10.0
+            and expert_map is None
+            and not apply_router_weight_on_input
         )
+        if k3_target_shape:
+            layer = _glm_exl3_k3_layer_for_instance(self)
+            if layer in _GLM_EXL3_K3_DUAL20_LAYERS:
+                _load_glm_exl3_k3_dual20_library()
+                weights, scratch = _load_glm_exl3_k3_packet(
+                    self, layer, hidden_states.device
+                )
+                if num_tokens == 8 and tuple(topk_ids.shape) == (8, 8):
+                    torch.ops.glm53_exl3_mcg_k3_dual20_m8.moe_out(
+                        hidden_states,
+                        *weights,
+                        topk_ids,
+                        topk_weights,
+                        *scratch,
+                        output,
+                    )
+                    logger.info_once(
+                        "Using GLM EXL3 MCG K3 for selected M8 routed layers."
+                    )
+                    return
+
+        use_m8_residual_dot8 = (
+            _ENABLE_GLM_M8_RESIDUAL_DOT8
+            and use_native_n32_kword_layout
+            and num_tokens == 8
+            and E == 288
+            and N == 2048
+            and K == 4096
+            and top_k_num == 8
+            and hidden_states.dtype == torch.bfloat16
+            and topk_ids.dtype == torch.int32
+            and topk_weights.dtype == torch.float32
+            and self.w1_scale.dtype == torch.bfloat16
+            and self.w2_scale.dtype == torch.bfloat16
+            and tuple(w1.shape[1:]) == (64, 512, 32)
+            and tuple(w2.shape[1:]) == (128, 128, 32)
+            and tuple(self.w1_scale.shape[1:]) == (64, 32, 32)
+            and tuple(self.w2_scale.shape[1:]) == (128, 8, 32)
+            and config["BLOCK_SIZE_M"] == 16
+            and activation == MoEActivation.SILU
+            and self.activation_config.clamp_limit == 10.0
+            and expert_map is None
+            and not apply_router_weight_on_input
+        )
+        if use_m8_residual_dot8:
+            _load_glm_m8_residual_dot8_library()
+            routes = num_tokens * top_k_num
+            gate_up = intermediate_cache1.view(routes, N)
+            hidden = intermediate_cache2.view(routes, activation_out_dim)
+            routed = intermediate_cache3.view(routes, K)
+
+            scratch_bytes = workspace13.view(torch.uint8).flatten()
+            scratch_offset = hidden.numel() * hidden.element_size()
+
+            def take_m8_scratch(shape: tuple[int, ...], dtype: torch.dtype):
+                nonlocal scratch_offset
+                numel = math.prod(shape)
+                nbytes = numel * 4
+                end = scratch_offset + nbytes
+                if end > scratch_bytes.numel():
+                    raise RuntimeError(
+                        "M8 residual-dot8 scratch exceeds the modular MoE workspace"
+                    )
+                view = (
+                    scratch_bytes.narrow(0, scratch_offset, nbytes)
+                    .view(dtype)
+                    .view(shape)
+                )
+                scratch_offset = end
+                return view
+
+            input_q0 = take_m8_scratch((num_tokens, K // 8), torch.int32)
+            input_s0 = take_m8_scratch((num_tokens, K // 32), torch.float32)
+            input_q1 = take_m8_scratch((num_tokens, K // 8), torch.int32)
+            input_s1 = take_m8_scratch((num_tokens, K // 32), torch.float32)
+            hidden_q0 = take_m8_scratch(
+                (routes, activation_out_dim // 8), torch.int32
+            )
+            hidden_s0 = take_m8_scratch(
+                (routes, activation_out_dim // 32), torch.float32
+            )
+            hidden_q1 = take_m8_scratch(
+                (routes, activation_out_dim // 8), torch.int32
+            )
+            hidden_s1 = take_m8_scratch(
+                (routes, activation_out_dim // 32), torch.float32
+            )
+
+            torch.ops.glm53_m8_residual_dot8.moe_out(
+                hidden_states,
+                w1,
+                self.w1_scale,
+                w2,
+                self.w2_scale,
+                topk_ids,
+                topk_weights,
+                input_q0,
+                input_s0,
+                input_q1,
+                input_s1,
+                gate_up,
+                hidden,
+                hidden_q0,
+                hidden_s0,
+                hidden_q1,
+                hidden_s1,
+                routed,
+            )
+            logger.info_once(
+                "Using the GLM M8 residual-dot8 W13/W2 path."
+            )
+            self.moe_sum(intermediate_cache3, output)
+            return
+
+        use_m4_residual_dot8 = (
+            _ENABLE_GLM_M4_RESIDUAL_DOT8
+            and use_native_n32_kword_layout
+            and num_tokens == 4
+            and E == 288
+            and N == 2048
+            and K == 4096
+            and top_k_num == 8
+            and hidden_states.dtype == torch.bfloat16
+            and topk_ids.dtype == torch.int32
+            and topk_weights.dtype == torch.float32
+            and self.w1_scale.dtype == torch.bfloat16
+            and self.w2_scale.dtype == torch.bfloat16
+            and tuple(w1.shape[1:]) == (64, 512, 32)
+            and tuple(w2.shape[1:]) == (128, 128, 32)
+            and tuple(self.w1_scale.shape[1:]) == (64, 32, 32)
+            and tuple(self.w2_scale.shape[1:]) == (128, 8, 32)
+            and config["BLOCK_SIZE_M"] == 16
+            and activation == MoEActivation.SILU
+            and self.activation_config.clamp_limit == 10.0
+            and expert_map is None
+            and not apply_router_weight_on_input
+        )
+        if use_m4_residual_dot8:
+            _load_glm_m4_residual_dot8_library()
+            routes = num_tokens * top_k_num
+            gate_up = intermediate_cache1.view(routes, N)
+            hidden = intermediate_cache2.view(routes, activation_out_dim)
+            routed = intermediate_cache3.view(routes, K)
+
+            scratch_bytes = workspace13.view(torch.uint8).flatten()
+            scratch_offset = hidden.numel() * hidden.element_size()
+
+            def take_m4_scratch(shape: tuple[int, ...], dtype: torch.dtype):
+                nonlocal scratch_offset
+                numel = math.prod(shape)
+                nbytes = numel * 4
+                end = scratch_offset + nbytes
+                if end > scratch_bytes.numel():
+                    raise RuntimeError(
+                        "M4 residual-dot8 scratch exceeds the modular MoE workspace"
+                    )
+                view = (
+                    scratch_bytes.narrow(0, scratch_offset, nbytes)
+                    .view(dtype)
+                    .view(shape)
+                )
+                scratch_offset = end
+                return view
+
+            input_q0 = take_m4_scratch((num_tokens, K // 8), torch.int32)
+            input_s0 = take_m4_scratch((num_tokens, K // 32), torch.float32)
+            input_q1 = take_m4_scratch((num_tokens, K // 8), torch.int32)
+            input_s1 = take_m4_scratch((num_tokens, K // 32), torch.float32)
+            hidden_q0 = take_m4_scratch(
+                (routes, activation_out_dim // 8), torch.int32
+            )
+            hidden_s0 = take_m4_scratch(
+                (routes, activation_out_dim // 32), torch.float32
+            )
+            hidden_q1 = take_m4_scratch(
+                (routes, activation_out_dim // 8), torch.int32
+            )
+            hidden_s1 = take_m4_scratch(
+                (routes, activation_out_dim // 32), torch.float32
+            )
+
+            torch.ops.glm53_m4_residual_dot8.moe_out(
+                hidden_states,
+                w1,
+                self.w1_scale,
+                w2,
+                self.w2_scale,
+                topk_ids,
+                topk_weights,
+                input_q0,
+                input_s0,
+                input_q1,
+                input_s1,
+                gate_up,
+                hidden,
+                hidden_q0,
+                hidden_s0,
+                hidden_q1,
+                hidden_s1,
+                routed,
+            )
+            logger.info_once(
+                "Using the GLM M4 residual-dot8 W13/W2 path."
+            )
+            self.moe_sum(intermediate_cache3, output)
+            return
+
+        # A single top-k=8 token does not need an E-wide expert sort. Preserve
+        # the promoted M=16 GEMM tile exactly: each selected expert receives one
+        # route id followed by 15 sentinel ids. This removes only the sort/count
+        # kernels, without changing the GEMM's numerical implementation.
+        # Keep this experimental path narrowly gated until it has broader
+        # upstream coverage; all other problems retain generic alignment.
+        use_m1_direct_route = (
+            _ENABLE_GLM_M1_DIRECT_ROUTE
+            and num_tokens == 1
+            and E == 288
+            and N in (1024, 2048)
+            and K == 4096
+            and top_k_num == 8
+            and hidden_states.dtype == torch.bfloat16
+            and topk_ids.dtype == torch.int32
+            and tuple(topk_ids.shape) == (1, 8)
+            and config["BLOCK_SIZE_M"] == 16
+            and self.quant_config.use_int4_w4a16
+            and tuple(self.block_shape or ()) == (0, 128)
+            and activation == MoEActivation.SILU
+            and expert_map is None
+        )
+        if use_m1_direct_route:
+            route_metadata = getattr(self, "_m1_direct_route_metadata", None)
+            if route_metadata is None:
+                block_size_m = config["BLOCK_SIZE_M"]
+                sorted_token_ids = torch.full(
+                    (top_k_num * block_size_m,),
+                    top_k_num,
+                    dtype=torch.int32,
+                    device=topk_ids.device,
+                )
+                sorted_token_ids[::block_size_m] = torch.arange(
+                    top_k_num, dtype=torch.int32, device=topk_ids.device
+                )
+                route_metadata = (
+                    sorted_token_ids,
+                    torch.tensor(
+                        [top_k_num * block_size_m],
+                        dtype=torch.int32,
+                        device=topk_ids.device,
+                    ),
+                )
+                self._m1_direct_route_metadata = route_metadata
+            sorted_token_ids, num_tokens_post_padded = route_metadata
+            expert_ids = topk_ids.reshape(-1)
+            logger.info_once(
+                "Using the GLM M=1 direct-route W4A16 MoE path."
+            )
+        elif (
+            _ENABLE_GLM_M8_SINGLE_LAUNCH_ALIGN
+            and use_native_n32_kword_layout
+            and num_tokens == 8
+            and E == 288
+            and N == 2048
+            and K == 4096
+            and top_k_num == 8
+            and hidden_states.dtype == torch.bfloat16
+            and topk_ids.dtype == torch.int32
+            and topk_ids.is_contiguous()
+            and tuple(topk_ids.shape) == (8, 8)
+            and config["BLOCK_SIZE_M"] == 16
+            and self.quant_config.use_int4_w4a16
+            and tuple(self.block_shape or ()) == (0, 128)
+            and activation == MoEActivation.SILU
+            and self.activation_config.clamp_limit == 10.0
+            and expert_map is None
+        ):
+            # Fixed M8/top-k=8 emits the exact generic grouped metadata in one
+            # launch. Both W4A16 GEMMs and all numerical epilogues are unchanged.
+            _load_glm_m8_single_launch_align_library()
+            route_metadata = getattr(
+                self, "_m8_single_launch_align_metadata", None
+            )
+            if route_metadata is None:
+                block_size_m = config["BLOCK_SIZE_M"]
+                routes = num_tokens * top_k_num
+                route_metadata = (
+                    torch.empty(
+                        routes * block_size_m,
+                        dtype=torch.int32,
+                        device=topk_ids.device,
+                    ),
+                    torch.empty(
+                        routes, dtype=torch.int32, device=topk_ids.device
+                    ),
+                    torch.empty(
+                        1, dtype=torch.int32, device=topk_ids.device
+                    ),
+                )
+                self._m8_single_launch_align_metadata = route_metadata
+            (
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+            ) = route_metadata
+            torch.ops.glm53_m8_align.align(
+                topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+            )
+            logger.info_once(
+                "Using the GLM M=8 single-launch W4A16 alignment path."
+            )
+        else:
+            # Include fused shared-expert rows while preserving EP remapping.
+            num_align_experts = (
+                w1.shape[0] if expert_map is None else global_num_experts
+            )
+            sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                moe_align_block_size(
+                    topk_ids,
+                    config["BLOCK_SIZE_M"],
+                    num_align_experts,
+                    expert_map,
+                )
+            )
+
+        use_resident_g128 = (
+            _ENABLE_GLM_RESIDENT_G128
+            and use_native_n32_kword_layout
+            and num_tokens >= 64
+            and E == 288
+            and N == 2048
+            and K == 4096
+            and top_k_num == 8
+            and hidden_states.dtype == torch.bfloat16
+            and topk_ids.dtype == torch.int32
+            and topk_weights.dtype == torch.float32
+            and self.w1_scale.dtype == torch.bfloat16
+            and self.w2_scale.dtype == torch.bfloat16
+            and tuple(w1.shape[1:]) == (64, 512, 32)
+            and tuple(w2.shape[1:]) == (128, 128, 32)
+            and tuple(self.w1_scale.shape[1:]) == (64, 32, 32)
+            and tuple(self.w2_scale.shape[1:]) == (128, 8, 32)
+            and config["BLOCK_SIZE_M"] == 16
+            and activation == MoEActivation.SILU
+            and self.activation_config.clamp_limit == 10.0
+            and expert_map is None
+            and not apply_router_weight_on_input
+        )
+        if use_resident_g128:
+            _load_glm_resident_g128_library()
+            routes = num_tokens * top_k_num
+            gate_up = intermediate_cache1.view(routes, N)
+            hidden = intermediate_cache2.view(routes, activation_out_dim)
+            routed = intermediate_cache3.view(routes, K)
+
+            scratch_bytes = workspace13.view(torch.uint8).flatten()
+            scratch_offset = hidden.numel() * hidden.element_size()
+
+            def take_scratch(shape: tuple[int, ...], dtype: torch.dtype):
+                nonlocal scratch_offset
+                numel = math.prod(shape)
+                nbytes = numel * 4  # All scratch views are int32 or fp32.
+                end = scratch_offset + nbytes
+                if end > scratch_bytes.numel():
+                    raise RuntimeError(
+                        "Resident G128 scratch exceeds the modular MoE workspace"
+                    )
+                view = (
+                    scratch_bytes.narrow(0, scratch_offset, nbytes)
+                    .view(dtype)
+                    .view(shape)
+                )
+                scratch_offset = end
+                return view
+
+            input_q0 = take_scratch((num_tokens, K // 8), torch.int32)
+            input_s0 = take_scratch((num_tokens, K // 32), torch.float32)
+            input_q1 = take_scratch((num_tokens, K // 8), torch.int32)
+            input_s1 = take_scratch((num_tokens, K // 32), torch.float32)
+            hidden_q0 = take_scratch(
+                (routes, activation_out_dim // 8), torch.int32
+            )
+            hidden_s0 = take_scratch(
+                (routes, activation_out_dim // 32), torch.float32
+            )
+            hidden_q1 = take_scratch(
+                (routes, activation_out_dim // 8), torch.int32
+            )
+            hidden_s1 = take_scratch(
+                (routes, activation_out_dim // 32), torch.float32
+            )
+            queue_head = take_scratch((1,), torch.int32)
+
+            torch.ops.glm53_resident_hybrid_g128.moe_out(
+                hidden_states,
+                w1,
+                self.w1_scale,
+                w2,
+                self.w2_scale,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                input_q0,
+                input_s0,
+                input_q1,
+                input_s1,
+                gate_up,
+                hidden,
+                hidden_q0,
+                hidden_s0,
+                hidden_q1,
+                hidden_s1,
+                routed,
+                queue_head,
+            )
+            logger.info_once(
+                "Using the GLM resident G128 W13/W2 path for M>=64."
+            )
+            self.moe_sum(intermediate_cache3, output)
+            return
 
         invoke_fused_moe_wna16_triton_kernel(
             hidden_states,
@@ -713,6 +1430,7 @@ class TritonWNA16Experts(TritonExperts):
             use_int8_w8a16=self.quant_config.use_int8_w8a16,
             use_int4_w4a16=self.quant_config.use_int4_w4a16,
             block_shape=self.block_shape,
+            use_native_n32_kword_layout=use_native_n32_kword_layout,
         )
 
         self.activation(
@@ -746,6 +1464,7 @@ class TritonWNA16Experts(TritonExperts):
             use_int8_w8a16=self.quant_config.use_int8_w8a16,
             use_int4_w4a16=self.quant_config.use_int4_w4a16,
             block_shape=self.block_shape,
+            use_native_n32_kword_layout=use_native_n32_kword_layout,
         )
 
         # separate function is required for MoE + LoRA

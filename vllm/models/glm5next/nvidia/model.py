@@ -60,9 +60,11 @@ from vllm.model_executor.models.glm4_1v import (
     Glm4vForConditionalGeneration,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
+    SupportsEagle3,
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
@@ -224,7 +226,10 @@ class Glm5NextMoE(nn.Module):
 
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
-            gate=self.gate,
+            # GLM computes router_logits explicitly in forward() below.  Do not
+            # also hand the same gate to MoERunner, which would recompute the
+            # identical projection before consuming the supplied logits.
+            gate=None,
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_token,
             hidden_size=config.hidden_size,
@@ -574,7 +579,7 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
 
-class Glm5NextModel(nn.Module):
+class Glm5NextModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -607,7 +612,15 @@ class Glm5NextModel(nn.Module):
             # Full-MLA config (no kpool sparse indexer): no topk buffer.
             topk_indices_buffer = None
 
-        if get_pp_group().is_first_rank:
+        # DFlash checkpoints intentionally omit token embeddings and share the
+        # target table.  The rank-local PP drafter lives on the last rank, so
+        # retain one target embedding copy there for sharing as well.
+        needs_last_rank_dflash_embed = bool(
+            get_pp_group().is_last_rank
+            and vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.use_dflash()
+        )
+        if get_pp_group().is_first_rank or needs_last_rank_dflash_embed:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -634,6 +647,7 @@ class Glm5NextModel(nn.Module):
         # The active slice is fixed after construction; cache it so forward
         # doesn't rebuild the slice (a fresh list) every step.
         self._active_layers = self.layers[self.start_layer : self.end_layer]
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -665,11 +679,24 @@ class Glm5NextModel(nn.Module):
                 self.config.mhc_num_residual_streams,
                 self.config.hidden_size,
             )
-        return IntermediateTensors(
-            {
-                "hidden_states": torch.zeros(hidden_shape, dtype=dtype, device=device)
-            }
+        tensors = {
+            "hidden_states": torch.zeros(hidden_shape, dtype=dtype, device=device)
+        }
+        # DFlash2 consumes target states from five layers spanning both PP
+        # stages.  Carry only the states produced before this stage; the last
+        # stage appends its local states before invoking the rank-local drafter.
+        num_upstream_aux = sum(
+            layer_id <= self.start_layer
+            for layer_id in self.aux_hidden_state_layers
         )
+        if num_upstream_aux:
+            tensors["dflash_aux_hidden_states"] = torch.zeros(
+                batch_size,
+                num_upstream_aux * self.config.hidden_size,
+                dtype=dtype,
+                device=device,
+            )
+        return IntermediateTensors(tensors)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -690,19 +717,45 @@ class Glm5NextModel(nn.Module):
             residual = None
             post = None
             comb = None
+            aux_hidden_states: list[torch.Tensor] = []
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = post = comb = None
+            packed_aux = intermediate_tensors.tensors.get(
+                "dflash_aux_hidden_states"
+            )
+            aux_hidden_states = (
+                list(packed_aux.split(self.config.hidden_size, dim=-1))
+                if packed_aux is not None
+                else []
+            )
 
         full_num_tokens = positions.shape[0]
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
 
-        for layer in self._active_layers:
+        for idx, layer in enumerate(self._active_layers, start=self.start_layer):
             hidden_states, residual, post, comb = layer(
                 positions, hidden_states, residual, post, comb
             )
+            if idx + 1 not in self.aux_hidden_state_layers:
+                continue
+            # Mid-stack mHC keeps four residual streams and defers hc_post.
+            # Materialize a read-only copy of the trained target feature while
+            # leaving the live recurrence untouched.
+            if post is not None and hasattr(layer, "hc_post"):
+                value = hc_contract(
+                    layer.hc_post(hidden_states, residual, post, comb),
+                    layer.n,
+                )
+            else:
+                value = hidden_states
+                if value.ndim == 3:
+                    value = value.mean(dim=1)
+            if self.is_sequence_parallel:
+                value = sp_all_gather(value)[:full_num_tokens]
+            aux_hidden_states.append(value)
 
         if not get_pp_group().is_last_rank:
             # Finish the last local layer before transport.  The next rank's
@@ -715,12 +768,19 @@ class Glm5NextModel(nn.Module):
                 hidden_states = last_layer.hc_post(
                     hidden_states, residual, post, comb
                 )
-            return IntermediateTensors({"hidden_states": hidden_states})
+            tensors = {"hidden_states": hidden_states}
+            if aux_hidden_states:
+                tensors["dflash_aux_hidden_states"] = torch.cat(
+                    aux_hidden_states, dim=-1
+                )
+            return IntermediateTensors(tensors)
 
         if self.is_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
         hidden_states = self.norm(hidden_states)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -885,7 +945,12 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForCausalLM(
-    nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
+    nn.Module,
+    HasInnerState,
+    SupportsPP,
+    MixtureOfExperts,
+    IsHybrid,
+    SupportsEagle3,
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -984,7 +1049,7 @@ class Glm5NextForCausalLM(
     dummy_inputs=Glm4vDummyInputsBuilder,
 )
 class Glm5NextForConditionalGeneration(
-    Glm4vForConditionalGeneration, HasInnerState, IsHybrid
+    Glm4vForConditionalGeneration, HasInnerState, IsHybrid, SupportsEagle3
 ):
     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The
     # multimodal wrapper must declare the same interfaces so vLLM treats it as

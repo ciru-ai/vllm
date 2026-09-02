@@ -2641,12 +2641,6 @@ class VllmConfig:
         if self._dflash_needs_multi_kv_group():
             unsupported.append("mixed sliding/full dflash drafts")
 
-        # The DFlash2 candidate selector exists only in the V2 speculator. On
-        # V1 the same checkpoint drafts through DFlashProposer, which never
-        # calls it, so the draft would degrade to DFlash1 silently.
-        if self._is_dflash2_draft():
-            unsupported.append("dflash2 drafts")
-
         if self.model_config is not None and self.model_config.is_diffusion:
             unsupported.append("diffusion models")
 

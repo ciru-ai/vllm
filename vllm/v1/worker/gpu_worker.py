@@ -1288,6 +1288,19 @@ class Worker(WorkerBase):
         pattern: str | None = None,
         max_size: int | None = None,
     ) -> None:
+        if envs.VLLM_GLM53_EXPORT_RUNTIME_PREPACK_V1:
+            from vllm.model_executor.model_loader.glm53_runtime_prepack_loader import (
+                Glm53RuntimePrepackLoader,
+            )
+
+            Glm53RuntimePrepackLoader.save_model(
+                self.model_runner.model,
+                self.model_config,
+                path,
+                pattern=pattern,
+                max_size=max_size,
+            )
+            return
         from vllm.model_executor.model_loader import ShardedStateLoader
 
         ShardedStateLoader.save_model(

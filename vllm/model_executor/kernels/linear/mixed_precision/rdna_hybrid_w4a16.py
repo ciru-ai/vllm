@@ -499,6 +499,8 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "_vllm_runtime_prepacked", False):
+            return
         c = self.config
 
         w_q_raw = getattr(layer, self.w_q_name)

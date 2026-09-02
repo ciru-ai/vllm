@@ -1274,6 +1274,7 @@ class ModelConfig:
                 "mxfp4",
                 "gpt_oss_mxfp4",
                 "deepseek_v4_fp8",
+                "glm53_hybrid",
                 "humming",
             ]
             # if the user specifies humming, we should always use humming
