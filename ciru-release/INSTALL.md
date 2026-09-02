@@ -1,6 +1,6 @@
 # Ciru GLM5.3 Strix runtime installation draft
 
-This source freeze is the runtime for **GLM5.3 Flash CIRU STRIX UI4**. It is
+This source freeze is the runtime for **GLM5.3 Flash CIRU STRIX IU4**. It is
 not stock vLLM and must not be replaced with a PyPI vLLM wheel.
 
 ## Frozen identities
@@ -71,7 +71,7 @@ Use the separately frozen Ciru AITER checkout rather than an unpinned package.
 It contains the two gfx1151 paged-MQA fixes and the PyTorch 2.13 namespace fix.
 
 ```bash
-export AITER_SOURCE=/srv/llm/releases-src/aiter-glm53-strix-ui4-v0.1.0-rc1
+export AITER_SOURCE=/srv/llm/releases-src/aiter-glm53-strix-iu4-v0.1.0-rc1
 git -C "$AITER_SOURCE" submodule update --init --recursive
 BUILD_TARGET=rocm ENABLE_CK=1 \
   "$VLLM_VENV/bin/python" -m pip install --no-build-isolation --no-deps \
@@ -87,7 +87,7 @@ operator names. Without it, PyTorch 2.13 records `aiter::aiter::<op>` and emits
 Set the ROCm wheel roots before invoking the normal vLLM build:
 
 ```bash
-export VLLM_SOURCE=/srv/llm/releases-src/vllm-glm53-strix-ui4-v0.1.0-rc1
+export VLLM_SOURCE=/srv/llm/releases-src/vllm-glm53-strix-iu4-v0.1.0-rc1
 export PYTORCH_ROCM_ARCH=gfx1151
 export VLLM_TARGET_DEVICE=rocm
 export ROCM_PATH="$site_packages/_rocm_sdk_devel"

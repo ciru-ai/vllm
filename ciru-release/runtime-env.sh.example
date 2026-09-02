@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Source-only environment for GLM5.3 Flash CIRU STRIX UI4.
+# Source-only environment for GLM5.3 Flash CIRU STRIX IU4.
 #
 # This file intentionally has no `set`, argument parsing, or `exec`: the model
 # launcher sources it and retains ownership of its positional arguments.

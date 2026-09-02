@@ -1,4 +1,4 @@
-# GLM5.3 Flash CIRU STRIX UI4 runtime freeze
+# GLM5.3 Flash CIRU STRIX IU4 runtime freeze
 
 This directory records the source-only runtime release over vLLM base
 `dccf404cd4ae5e9c06e940ad9bc49ee8f762a275`.
