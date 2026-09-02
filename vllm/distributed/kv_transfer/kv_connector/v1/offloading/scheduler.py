@@ -146,6 +146,17 @@ def is_store_reachable_swa_chunk(
     return position_in_segment >= actual_segment_length - reachable_tail
 
 
+def get_source_group_ids(kv_cache_config: KVCacheConfig) -> tuple[int, ...]:
+    """Return full-cache group IDs represented by the offloading spec."""
+    return tuple(
+        group_id
+        for group_id in kv_cache_config.transfer_group_ids
+        if kv_cache_config.kv_cache_groups[
+            group_id
+        ].kv_cache_spec.participates_in_prefix_caching
+    )
+
+
 def resolve_mamba_align_size(
     spec: "OffloadingSpec", kv_cache_config: KVCacheConfig
 ) -> int | None:
@@ -157,8 +168,14 @@ def resolve_mamba_align_size(
     such groups agree on the same value.
     """
     mamba_align_size: int | None = None
-    for idx, tokens_per_block in enumerate(spec.tokens_per_block):
-        kv_spec = kv_cache_config.kv_cache_groups[idx].kv_cache_spec
+    source_groups = tuple(
+        kv_cache_config.kv_cache_groups[group_id]
+        for group_id in get_source_group_ids(kv_cache_config)
+    )
+    for kv_cache_group, tokens_per_block in zip(
+        source_groups, spec.tokens_per_block, strict=True
+    ):
+        kv_spec = kv_cache_group.kv_cache_spec
         if isinstance(kv_spec, MambaSpec) and kv_spec.mamba_cache_mode in (
             "align",
             "all",
@@ -170,6 +187,7 @@ def resolve_mamba_align_size(
 
 
 class SchedulerOffloadConfig(NamedTuple):
+    source_group_ids: tuple[int, ...]
     kv_group_configs: tuple[GroupOffloadConfig, ...]
     blocks_per_chunk: int
     tokens_per_hash: int
@@ -184,14 +202,22 @@ class SchedulerOffloadConfig(NamedTuple):
         vllm_config: VllmConfig,
         kv_cache_config: KVCacheConfig,
     ) -> "SchedulerOffloadConfig":
+        source_group_ids = get_source_group_ids(kv_cache_config)
+        source_groups = tuple(
+            kv_cache_config.kv_cache_groups[group_id]
+            for group_id in source_group_ids
+        )
+
         # Determine the alignment token count from the full-attention group(s).
         # This is the tokens_per_chunk of the full-attention group; load
         # hits are always aligned to this boundary, so SWA blocks earlier in
         # each segment can never serve a load hit. Relevant for hybrid
         # architectures like DeepSeek V4 (MLA + SWA groups).
         full_attn_tokens_per_chunk: set[int] = set()
-        for idx, tokens_per_block in enumerate(spec.tokens_per_block):
-            kv_spec = kv_cache_config.kv_cache_groups[idx].kv_cache_spec
+        for kv_cache_group, tokens_per_block in zip(
+            source_groups, spec.tokens_per_block, strict=True
+        ):
+            kv_spec = kv_cache_group.kv_cache_spec
             sw = get_sliding_window_size_in_chunks(
                 kv_spec, tokens_per_block * spec.blocks_per_chunk
             )
@@ -219,7 +245,7 @@ class SchedulerOffloadConfig(NamedTuple):
 
         eagle_groups = {
             idx
-            for idx, g in enumerate(kv_cache_config.kv_cache_groups)
+            for idx, g in enumerate(source_groups)
             if g.is_eagle_group
         }
 
@@ -228,7 +254,7 @@ class SchedulerOffloadConfig(NamedTuple):
             and vllm_config.speculative_config.use_eagle()
         )
         if use_eagle and not eagle_groups:
-            eagle_groups = set(range(len(kv_cache_config.kv_cache_groups)))
+            eagle_groups = set(range(len(source_groups)))
 
         if eagle_groups:
             logger.info(
@@ -239,8 +265,9 @@ class SchedulerOffloadConfig(NamedTuple):
             )
 
         kv_group_configs_list: list[GroupOffloadConfig] = []
-        for idx, tokens_per_block in enumerate(spec.tokens_per_block):
-            kv_cache_group = kv_cache_config.kv_cache_groups[idx]
+        for idx, (kv_cache_group, tokens_per_block) in enumerate(
+            zip(source_groups, spec.tokens_per_block, strict=True)
+        ):
             kv_spec = kv_cache_group.kv_cache_spec
             sw = get_sliding_window_size_in_chunks(
                 kv_spec, tokens_per_block * spec.blocks_per_chunk
@@ -290,6 +317,7 @@ class SchedulerOffloadConfig(NamedTuple):
         )
 
         return cls(
+            source_group_ids=source_group_ids,
             num_workers=vllm_config.parallel_config.world_size,
             kv_group_configs=kv_group_configs,
             blocks_per_chunk=spec.blocks_per_chunk,
@@ -1117,6 +1145,12 @@ class OffloadingConnectorScheduler:
             if preempted:
                 for group_state in req_status.group_states:
                     group_state.block_ids.clear()
+
+            if new_block_id_groups is not None:
+                new_block_id_groups = tuple(
+                    new_block_id_groups[source_group_id]
+                    for source_group_id in self.config.source_group_ids
+                )
 
             if new_block_id_groups:
                 if self._sliding_window_groups:
