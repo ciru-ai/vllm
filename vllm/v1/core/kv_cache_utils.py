@@ -1173,7 +1173,11 @@ def _get_kv_cache_groups_glm5_next(
         }
         tail_uniform = UniformTypeKVCacheSpecs.from_specs(padded_tail_specs)
         assert tail_uniform is not None
-        tail_group = KVCacheGroupSpec(list(padded_tail_specs), tail_uniform)
+        tail_group = KVCacheGroupSpec(
+            list(padded_tail_specs),
+            tail_uniform,
+            enable_kv_transfer=False,
+        )
 
     any_mamba = next(iter(mamba_specs.values()))
     assert all(spec == any_mamba for spec in mamba_specs.values())

@@ -47,7 +47,8 @@ def build_offloading_config(
             ),
             layer_names=tuple(group.layer_names),
         )
-        for group in kv_cache_config.kv_cache_groups
+        for group in kv_cache_config.transfer_groups
+        if group.kv_cache_spec.participates_in_prefix_caching
     )
 
     _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
