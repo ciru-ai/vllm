@@ -371,6 +371,25 @@ def test_preserves_data_parallel_config():
     assert offloading_config.parallel.data_parallel_rank_local == 1
 
 
+@pytest.mark.parametrize(
+    ("executor_backend", "expected_workers"),
+    [("external_launcher", 1), ("mp", 4)],
+)
+def test_scheduler_completion_worker_count(
+    executor_backend: str, expected_workers: int
+):
+    config = _make_vllm_config(tensor_parallel_size=4)
+    config.parallel_config.distributed_executor_backend = executor_backend
+    kv_cache_config = _make_kv_cache_config()
+    offloading_config = build_offloading_config(config, kv_cache_config)
+
+    scheduler_config = SchedulerOffloadConfig.from_spec(
+        MockOffloadingSpec(offloading_config), config, kv_cache_config
+    )
+
+    assert scheduler_config.num_workers == expected_workers
+
+
 def test_resolves_heterogeneous_hybrid_block_sizes():
     config = _make_vllm_config()
     config.cache_config.block_size = 4

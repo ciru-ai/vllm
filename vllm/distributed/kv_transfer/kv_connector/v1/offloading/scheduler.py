@@ -310,7 +310,15 @@ class SchedulerOffloadConfig(NamedTuple):
 
         return cls(
             source_group_ids=source_group_ids,
-            num_workers=vllm_config.parallel_config.world_size,
+            # External launcher gives every rank its own scheduler and local
+            # UniProc worker, so worker metadata is not aggregated across ranks.
+            # Distributed executors aggregate one completion per world rank.
+            num_workers=(
+                1
+                if vllm_config.parallel_config.distributed_executor_backend
+                == "external_launcher"
+                else vllm_config.parallel_config.world_size
+            ),
             kv_group_configs=kv_group_configs,
             blocks_per_chunk=spec.blocks_per_chunk,
             tokens_per_hash=spec.tokens_per_hash,
