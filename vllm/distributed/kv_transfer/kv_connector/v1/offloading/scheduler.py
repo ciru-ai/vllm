@@ -16,6 +16,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     ReqId,
     TransferJob,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+    get_offloading_source_group_ids,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.events import (
     OffloadingEventGroupSpec,
     OffloadingEventsTracker,
@@ -146,17 +149,6 @@ def is_store_reachable_swa_chunk(
     return position_in_segment >= actual_segment_length - reachable_tail
 
 
-def get_source_group_ids(kv_cache_config: KVCacheConfig) -> tuple[int, ...]:
-    """Return full-cache group IDs represented by the offloading spec."""
-    return tuple(
-        group_id
-        for group_id in kv_cache_config.transfer_group_ids
-        if kv_cache_config.kv_cache_groups[
-            group_id
-        ].kv_cache_spec.participates_in_prefix_caching
-    )
-
-
 def resolve_mamba_align_size(
     spec: "OffloadingSpec", kv_cache_config: KVCacheConfig
 ) -> int | None:
@@ -170,7 +162,7 @@ def resolve_mamba_align_size(
     mamba_align_size: int | None = None
     source_groups = tuple(
         kv_cache_config.kv_cache_groups[group_id]
-        for group_id in get_source_group_ids(kv_cache_config)
+        for group_id in get_offloading_source_group_ids(kv_cache_config)
     )
     for kv_cache_group, tokens_per_block in zip(
         source_groups, spec.tokens_per_block, strict=True
@@ -202,7 +194,7 @@ class SchedulerOffloadConfig(NamedTuple):
         vllm_config: VllmConfig,
         kv_cache_config: KVCacheConfig,
     ) -> "SchedulerOffloadConfig":
-        source_group_ids = get_source_group_ids(kv_cache_config)
+        source_group_ids = get_offloading_source_group_ids(kv_cache_config)
         source_groups = tuple(
             kv_cache_config.kv_cache_groups[group_id]
             for group_id in source_group_ids

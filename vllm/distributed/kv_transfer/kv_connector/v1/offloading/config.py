@@ -23,6 +23,19 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 
+def get_offloading_source_group_ids(
+    kv_cache_config: "KVCacheConfig",
+) -> tuple[int, ...]:
+    """Return full-cache group IDs represented by the offloading spec."""
+    return tuple(
+        group_id
+        for group_id in kv_cache_config.transfer_group_ids
+        if kv_cache_config.kv_cache_groups[
+            group_id
+        ].kv_cache_spec.participates_in_prefix_caching
+    )
+
+
 def build_offloading_config(
     vllm_config: "VllmConfig",
     kv_cache_config: "KVCacheConfig",
@@ -35,6 +48,10 @@ def build_offloading_config(
     engine_id = kv_transfer_config.engine_id
 
     parallel_config = vllm_config.parallel_config
+    source_group_ids = get_offloading_source_group_ids(kv_cache_config)
+    source_groups = tuple(
+        kv_cache_config.kv_cache_groups[group_id] for group_id in source_group_ids
+    )
     groups = tuple(
         OffloadingGroupConfig(
             tokens_per_block=(
@@ -47,8 +64,7 @@ def build_offloading_config(
             ),
             layer_names=tuple(group.layer_names),
         )
-        for group in kv_cache_config.transfer_groups
-        if group.kv_cache_spec.participates_in_prefix_caching
+        for group in source_groups
     )
 
     _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
