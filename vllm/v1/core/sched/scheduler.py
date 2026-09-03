@@ -469,6 +469,42 @@ class Scheduler(SchedulerInterface):
         self, request: Request
     ) -> tuple[KVCacheBlocks, int, int, bool]:
         connector = self.connector
+        if (
+            connector is not None
+            and self.parallel_config.distributed_executor_backend == "external_launcher"
+            and self.parallel_config.world_size > 1
+        ):
+            # Mirrored external-launcher engines have independent GPU caches.
+            # Re-query under each common bound; truncation alone cannot produce
+            # a Mamba checkpoint that the rank has not retained at that boundary.
+            import torch
+            import torch.distributed as dist
+            from vllm.distributed.parallel_state import get_world_group
+
+            manager = self.kv_cache_manager
+            limit = request.num_tokens - 1
+            cpu_group = get_world_group().cpu_group
+            while True:
+                if manager.prefix_cache_lookup_enabled(request):
+                    computed, num_local, _num_uncached = (
+                        manager.coordinator.find_longest_cache_hit(
+                            request.block_hashes, limit
+                        )
+                    )
+                    blocks = manager.create_kv_cache_blocks(computed)
+                else:
+                    blocks = manager.empty_kv_cache_blocks
+                    num_local = 0
+                state = torch.tensor(
+                    [num_local, -num_local], dtype=torch.int64, device="cpu"
+                )
+                dist.all_reduce(state, op=dist.ReduceOp.MIN, group=cpu_group)
+                common, negative_max = state.tolist()
+                if common == -negative_max:
+                    # A rank-specific retention junction must not change chunk
+                    # scheduling independently of the agreed resume boundary.
+                    return blocks, num_local, 0, False
+                limit = common
         if connector is not None and connector.supports_divergent_local_hybrid_hits:
             return self.kv_cache_manager.get_computed_blocks_for_connector(request)
 

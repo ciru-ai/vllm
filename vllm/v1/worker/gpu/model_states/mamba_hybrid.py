@@ -102,16 +102,17 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
+            self._pending_mamba_state_init: dict[int, int] = {}
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
         # Must reset the speculative acceptance count in this idx which could be stale.
         self.num_accepted_tokens_gpu[req_index].fill_(1)
         if self._align_mode:
-            # Seed the running state block from the resumed/prefilled position.
-            self._mamba_state_idx_gpu[req_index].fill_(
-                (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
-            )
+            # Draft setup can mutate the global cache block size. Defer seeding
+            # until preprocess_state has the authoritative MambaSpec.
+            self._pending_mamba_state_init[req_index] = new_req_data.num_computed_tokens
+            self._mamba_state_idx_gpu[req_index].fill_(-1)
 
     def _get_mamba_group_info(
         self, kv_cache_config: KVCacheConfig
@@ -185,6 +186,11 @@ class MambaHybridModelState(DefaultModelState):
         if num_reqs == 0:
             return
         mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
+        for req_index, computed_tokens in self._pending_mamba_state_init.items():
+            self._mamba_state_idx_gpu[req_index].fill_(
+                (computed_tokens - 1) // mamba_spec.block_size
+            )
+        self._pending_mamba_state_init.clear()
         ctx = self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
 
         # The state-advance + pre-copy kernels run every step; they fast-exit per

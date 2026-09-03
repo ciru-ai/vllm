@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
+from math import lcm
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import chain, islice
@@ -358,6 +359,8 @@ class RequestOffloadState:
     # Fine-grained token boundary selected beyond the last complete offload
     # chunk. It is consumed when the corresponding load is scheduled.
     partial_tail_boundary: int | None = None
+    # Maximum externally restored boundary agreed by independent TP schedulers.
+    lookup_max_tokens: int | None = None
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
 
@@ -528,6 +531,23 @@ class OffloadingConnectorScheduler:
         )
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats = OffloadingConnectorStats()
+        self._external_cache_cpu_group = None
+        parallel = vllm_config.parallel_config
+        if (
+            parallel.distributed_executor_backend == "external_launcher"
+            and parallel.world_size > 1
+        ):
+            # ExternalLauncher shares its initialized worker world group.
+            if vllm_config.scheduler_config.max_num_seqs != 1:
+                raise ValueError(
+                    "External-launcher prefix-cache admission requires "
+                    "max_num_seqs=1 and identically ordered mirrored requests"
+                )
+            from vllm.distributed.parallel_state import get_world_group
+
+            self._external_cache_cpu_group = get_world_group().cpu_group
+        primary = getattr(self.manager, "primary_tier", self.manager)
+        self._lookup_primary_capacity = getattr(primary, "_num_blocks", None)
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -658,6 +678,85 @@ class OffloadingConnectorScheduler:
                     break
         return hit_count if not defer_lookup else None
 
+    def _capacity_limited_boundary(self, req_status: RequestOffloadState) -> int:
+        """Fit a candidate prefix into CPU staging before promoting any files.
+
+        Full-attention groups need their prefix; recurrent/windowed groups need
+        only their tail. Leave one slot per group for boundary convergence.
+        """
+        if self._external_cache_cpu_group is None:
+            return req_status.req.num_tokens
+        limit = req_status.req.num_tokens - 1
+        if req_status.lookup_max_tokens is not None:
+            limit = min(limit, req_status.lookup_max_tokens)
+        capacity = self._lookup_primary_capacity
+        if capacity is None:
+            return limit
+        local = req_status.num_locally_computed_tokens
+        groups = self.config.kv_group_configs
+        alignment = lcm(*(group.tokens_per_chunk for group in groups))
+        budget = max(0, capacity - len(groups))
+
+        def required_blocks(boundary: int) -> int:
+            count = 0
+            for group in groups:
+                chunks = max(
+                    0,
+                    boundary // group.tokens_per_chunk
+                    - local // group.tokens_per_chunk,
+                )
+                chunks += int(group.is_eagle_group and chunks > 0)
+                if group.sliding_window_size_in_chunks is not None:
+                    chunks = min(
+                        chunks,
+                        group.sliding_window_size_in_chunks
+                        + int(group.is_eagle_group),
+                    )
+                count += chunks
+            return count
+
+        low = local // alignment
+        high = max(low, limit // alignment)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if required_blocks(middle * alignment) <= budget:
+                low = middle
+            else:
+                high = middle - 1
+        return min(limit, max(local, low * alignment))
+
+    def _agree_external_hit(
+        self, req_status: RequestOffloadState, num_hit_tokens: int | None
+    ) -> int | None:
+        """Admit only a ready boundary backed by every mirrored TP rank.
+
+        A smaller common boundary needs another lookup: a recurrent checkpoint
+        at the larger boundary does not imply one exists at the smaller one.
+        """
+        if self._external_cache_cpu_group is None:
+            return num_hit_tokens
+        import torch
+        import torch.distributed as dist
+
+        ready = num_hit_tokens is not None
+        boundary = (
+            req_status.num_locally_computed_tokens + num_hit_tokens if ready else 0
+        )
+        state = torch.tensor(
+            [int(ready), boundary, -boundary], dtype=torch.int64, device="cpu"
+        )
+        dist.all_reduce(
+            state, op=dist.ReduceOp.MIN, group=self._external_cache_cpu_group
+        )
+        all_ready, common, negative_max = state.tolist()
+        if not all_ready:
+            return None
+        if common != -negative_max:
+            req_status.lookup_max_tokens = common
+            req_status.partial_tail_boundary = None
+            return None
+        return common - req_status.num_locally_computed_tokens
+
     def _sliding_window_lookup(
         self,
         keys: Sequence[OffloadKey],
@@ -674,15 +773,15 @@ class OffloadingConnectorScheduler:
                 case LookupResult.HIT:
                     consecutive_hits += 1
                 case LookupResult.HIT_PENDING:
-                    # Block is in cache, just not readable yet — counts
-                    # as hit for the consecutive streak. Don't break:
-                    # keep scanning to let manager kick off async lookups.
+                    # Await this candidate before promoting older recurrent
+                    # checkpoints, which can evict the full-attention prefix.
+                    if self._external_cache_cpu_group is not None:
+                        return None
                     defer_lookup = True
                     consecutive_hits += 1
                 case LookupResult.RETRY:
-                    # Block location uncertain — does not count as hit.
-                    # Don't break: keep scanning to let manager kick off
-                    # async lookups.
+                    if self._external_cache_cpu_group is not None:
+                        return None
                     defer_lookup = True
                     consecutive_hits = 0
                 case LookupResult.MISS:
@@ -732,12 +831,12 @@ class OffloadingConnectorScheduler:
         happens until num_hit_tokens converges.
         """
         num_computed_tokens = req_status.num_locally_computed_tokens
-        max_hit_size_tokens: int = req_status.req.num_tokens
+        max_hit_size_tokens = self._capacity_limited_boundary(req_status)
         if self._sliding_window_groups:
-            # the last prompt token has to be recomputed to get the logprobs
-            # for sliding window attention, we must reduce by 1 to make sure
-            # we still have a hit after reduction
-            max_hit_size_tokens -= 1
+            # Recompute the final prompt token. External-launcher capacity
+            # lookup has already excluded it before applying its staging cap.
+            if self._external_cache_cpu_group is None:
+                max_hit_size_tokens -= 1
             if self._mamba_align_size is not None:
                 # Constrain hit-window to the mamba block size.
                 max_hit_size_tokens = round_down(
@@ -785,9 +884,12 @@ class OffloadingConnectorScheduler:
                 )
 
                 # For eagle groups, query one extra chunk that will be popped.
-                # We only need to increase the query size for sliding window groups.
+                # Full attention also needs it when bounded below request length.
                 query_max = max_hit_size_tokens
-                if is_eagle_unverified and sliding_window_size_in_chunks is not None:
+                if is_eagle_unverified and (
+                    sliding_window_size_in_chunks is not None
+                    or self._external_cache_cpu_group is not None
+                ):
                     query_max = min(
                         max_hit_size_tokens + tokens_per_chunk,
                         len(offload_keys) * tokens_per_chunk,
@@ -914,6 +1016,8 @@ class OffloadingConnectorScheduler:
         max_boundary = round_down(
             min(req_status.req.num_prompt_tokens - 1, block_end - 1), tokens_per_hash
         )
+        if req_status.lookup_max_tokens is not None:
+            max_boundary = min(max_boundary, req_status.lookup_max_tokens)
         if max_boundary <= complete_boundary:
             return complete_hit
 
@@ -992,7 +1096,7 @@ class OffloadingConnectorScheduler:
                 "Delaying request %s since it still has in-flight transfers",
                 request.request_id,
             )
-            return None, False
+            return self._agree_external_hit(req_status, None), False
 
         req_status.update_offload_keys()
         req_status.num_locally_computed_tokens = num_computed_tokens
@@ -1003,6 +1107,7 @@ class OffloadingConnectorScheduler:
         else:
             lookup_start = time.monotonic()
             num_hit_tokens = self._lookup(req_status)
+            num_hit_tokens = self._agree_external_hit(req_status, num_hit_tokens)
             self._connector_stats.observe_histogram(
                 _ConnectorMetricName.LOOKUP_SYNC_DELAY,
                 time.monotonic() - lookup_start,
@@ -1012,6 +1117,8 @@ class OffloadingConnectorScheduler:
                     req_status.deferred_lookup_start_time = lookup_start
             else:
                 self._maybe_observe_lookup_async_delay(req_status)
+        if request.skip_reading_prefix_cache:
+            num_hit_tokens = self._agree_external_hit(req_status, num_hit_tokens)
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
         self._touch(req_status)
