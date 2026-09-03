@@ -1037,10 +1037,16 @@ class OffloadingConnectorScheduler:
         # per group
         group_sizes: list[int] = []
         block_indices: list[int] = []
+        # Allocation returns physical KV groups, including non-transferable
+        # groups. Match the same projection used for store block IDs.
+        transfer_blocks = tuple(
+            blocks.blocks[source_group_id]
+            for source_group_id in self.config.source_group_ids
+        )
         for group_config, group_state, group_blocks in zip(
             self.config.kv_group_configs,
             req_status.group_states,
-            blocks.blocks,
+            transfer_blocks,
         ):
             self._current_batch_allocated_block_ids.update(
                 block.block_id for block in group_blocks if block.block_id != 0
@@ -1256,6 +1262,21 @@ class OffloadingConnectorScheduler:
         handoffs = block_state.boundary_state_offloads if block_state else None
         if not handoffs:
             return {}
+
+        # Core handoffs use physical KV group IDs; offload keys and specs use
+        # the filtered transfer-group indices (e.g. GLM excludes KpoolTail).
+        source_to_transfer = {
+            source_group_id: group_idx
+            for group_idx, source_group_id in enumerate(self.config.source_group_ids)
+        }
+        handoffs = {
+            req_id: [
+                (source_to_transfer[source_group_id], block_id, boundary)
+                for source_group_id, block_id, boundary in entries
+                if source_group_id in source_to_transfer
+            ]
+            for req_id, entries in handoffs.items()
+        }
 
         store_jobs = self._build_aligned_boundary_store_jobs(handoffs)
         if not self.config.supports_partial_tail:
