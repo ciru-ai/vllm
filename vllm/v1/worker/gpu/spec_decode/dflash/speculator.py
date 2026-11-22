@@ -500,9 +500,9 @@ class DFlashSpeculator(DraftModelSpeculator):
             and (
                 dummy_run
                 or input_batch.has_prefill
-                or input_batch.num_reqs != 1
-                or input_batch.num_tokens != self.num_query_per_req
-                or input_batch.num_draft_tokens != self.num_speculative_steps
+                or input_batch.num_reqs < 1
+                or input_batch.num_tokens != input_batch.num_reqs * self.num_query_per_req
+                or input_batch.num_draft_tokens != input_batch.num_reqs * self.num_speculative_steps
                 or num_speculative_tokens != self.num_speculative_steps
             )
         )

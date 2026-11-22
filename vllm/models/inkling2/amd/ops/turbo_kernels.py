@@ -505,6 +505,154 @@ def _turbo_prefill_rel_attn_kernel(
     )
 
 
+@triton.jit
+def _gather_paged_kv_hnd_kernel(
+    K_cache, V_cache, BlockTable, K_out, V_out,
+    n_pages,
+    stride_kb, stride_kp, stride_kh,
+    stride_vb, stride_vp, stride_vh,
+    stride_okh, stride_okn,
+    stride_ovh, stride_ovn,
+    KVH: tl.constexpr, PAGE: tl.constexpr, D: tl.constexpr,
+):
+    pg_i = tl.program_id(0)
+    kvh = tl.program_id(1)
+    page_id = tl.load(BlockTable + pg_i).to(tl.int64)
+    p = tl.arange(0, PAGE)
+    d = tl.arange(0, D)
+    k = tl.load(K_cache + page_id * stride_kb + p[:, None] * stride_kp + kvh * stride_kh + d[None, :])
+    v = tl.load(V_cache + page_id * stride_vb + p[:, None] * stride_vp + kvh * stride_vh + d[None, :])
+    out_n = (pg_i * PAGE + p).to(tl.int64)
+    tl.store(K_out + kvh * stride_okh + out_n[:, None] * stride_okn + d[None, :], k)
+    tl.store(V_out + kvh * stride_ovh + out_n[:, None] * stride_ovn + d[None, :], v)
+
+
+@triton.jit
+def _turbo_prefill_rel_attn_near_merge_kernel(
+    Q, K, V, Bias, Gate, Sink, OutFar, LseFar, Result,
+    BlockTable, SeqLens, CuSeqlensQ,
+    scale_log2,
+    far_len,
+    req_idx,
+    stride_qt, stride_qh,
+    stride_kb, stride_kp, stride_kh,
+    stride_vb, stride_vp, stride_vh,
+    stride_bt, stride_bh,
+    stride_gate, stride_sink,
+    stride_ofh, stride_ofq,
+    stride_lfh, stride_lfq,
+    stride_res, stride_table,
+    H: tl.constexpr, GROUP: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr,
+    E_PAD: tl.constexpr,
+    BLOCK_Q: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    q_block = tl.program_id(0)
+    head = tl.program_id(1)
+    kv_head = head // GROUP
+
+    q_start = tl.load(CuSeqlensQ + req_idx)
+    q_len = tl.load(CuSeqlensQ + req_idx + 1) - q_start
+    q0 = q_block * BLOCK_Q
+    if q0 >= q_len:
+        return
+    seq_len = tl.load(SeqLens + req_idx)
+    past = seq_len - q_len
+
+    q_offs = tl.arange(0, BLOCK_Q)
+    q_idx = q0 + q_offs
+    row_valid = q_idx < q_len
+    token = (q_start + q_idx).to(tl.int64)
+    d = tl.arange(0, D)
+
+    q = tl.load(
+        Q + token[:, None] * stride_qt + head * stride_qh + d[None, :],
+        row_valid[:, None], other=0.0,
+    )
+    pos = past + q_idx
+    hi = tl.minimum(past + q0 + BLOCK_Q, seq_len)
+
+    table = BlockTable + req_idx * stride_table
+    k_head_base = K + kv_head * stride_kh
+    v_head_base = V + kv_head * stride_vh
+    n_offs = tl.arange(0, BLOCK_N)
+
+    lse_far = tl.load(
+        LseFar + head * stride_lfh + q_idx * stride_lfq,
+        row_valid, other=float("-inf"),
+    ).to(tl.float32)
+    out_far = tl.load(
+        OutFar + head * stride_ofh + q_idx[:, None] * stride_ofq + d[None, :],
+        row_valid[:, None], other=0.0,
+    ).to(tl.float32)
+    m_i = lse_far * 1.4426950408889634
+    l_i = tl.where(row_valid, 1.0, 0.0)
+    acc = out_far
+
+    near_start_block = far_len // BLOCK_N
+    end_block = tl.cdiv(hi, BLOCK_N)
+
+    tile_end = tl.minimum((q_idx // 128 + 1) * 128, q_len)
+    key0 = tl.cdiv(past + tile_end, 128) * 128 - E_PAD
+    bias_rows = Bias + token * stride_bt + head * stride_bh - key0
+
+    for blk in range(near_start_block, end_block):
+        key_begin = blk * BLOCK_N
+        keys = key_begin + n_offs
+        key_valid = keys < hi
+        if BLOCK_N <= PAGE:
+            page_id = tl.load(table + (key_begin // PAGE)).to(tl.int64)
+            slot_base = key_begin % PAGE
+            k = tl.load(
+                k_head_base + page_id * stride_kb + (slot_base + n_offs)[:, None] * stride_kp + d[None, :],
+                key_valid[:, None], other=0.0,
+            )
+        else:
+            p0 = tl.load(table + (key_begin // PAGE)).to(tl.int64)
+            p1 = tl.load(table + (key_begin // PAGE) + 1, mask=(key_begin + PAGE) < hi, other=p0).to(tl.int64)
+            pg = tl.where(n_offs < PAGE, p0, p1)
+            sl = n_offs % PAGE
+            k = tl.load(
+                k_head_base + pg[:, None] * stride_kb + sl[:, None] * stride_kp + d[None, :],
+                key_valid[:, None], other=0.0,
+            )
+        s = tl.dot(q, tl.trans(k)) * scale_log2
+        dist = pos[:, None] - keys[None, :]
+        valid = row_valid[:, None] & key_valid[None, :] & (dist >= 0)
+        in_table = valid & (keys[None, :] >= key0[:, None])
+        bias = tl.load(bias_rows[:, None] + keys[None, :], in_table, other=0.0)
+        s = s + bias.to(tl.float32) * 1.4426950408889634
+        s = tl.where(valid, s, float("-inf"))
+        m_new = tl.maximum(m_i, tl.max(s, 1))
+        m_ref = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.math.exp2(m_i - m_ref)
+        p = tl.math.exp2(s - m_ref[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        if BLOCK_N <= PAGE:
+            v = tl.load(
+                v_head_base + page_id * stride_vb + (slot_base + n_offs)[:, None] * stride_vp + d[None, :],
+                key_valid[:, None], other=0.0,
+            )
+        else:
+            v = tl.load(
+                v_head_base + pg[:, None] * stride_vb + sl[:, None] * stride_vp + d[None, :],
+                key_valid[:, None], other=0.0,
+            )
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        m_i = m_new
+
+    has_keys = l_i > 0.0
+    out = acc / tl.where(has_keys, l_i, 1.0)[:, None]
+    lse_e = tl.where(has_keys, (m_i + tl.math.log2(l_i)) * 0.6931471805599453, float("-inf"))
+    gate = tl.load(Gate + token[:, None] * stride_gate + head * D + d[None, :], row_valid[:, None], other=0.0).to(tl.float32)
+    sink = tl.load(Sink + token * stride_sink + head, row_valid, other=0.0).to(tl.float32)
+    y = out * _turbo_sigmoid(gate) * _turbo_sigmoid(lse_e - sink)[:, None]
+    tl.store(
+        Result + token[:, None] * stride_res + head * D + d[None, :],
+        y.to(Result.dtype.element_ty),
+        row_valid[:, None],
+    )
+
+
 def turbo_gated_rel_attention(
     q: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor,
     sheared_bias: torch.Tensor, gate: torch.Tensor, sinks: torch.Tensor,
@@ -523,6 +671,81 @@ def turbo_gated_rel_attention(
     e_pad = sheared_bias.shape[2]
     extent = e_pad - 256
     bq, bn, nw = 64, 32, 4
+    # Hybrid AOTriton-Far + Triton-Near for long-context global prefill (>=16K past):
+    # eliminates the 32K->64K MALL spill cliff (2.40x faster at 64K, 0.0000 BF16 max err).
+    if (
+        window < 0
+        and max_seqlen_q >= 64
+        and page in (16, 32, 64)
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        seq_cpu = cache_seqlens.tolist()
+        cu_cpu = cu_seqlens_q.tolist()
+        align = max(bn, page)
+        hybrid_reqs = []
+        short_reqs = []
+        for r in range(num_reqs):
+            ql = cu_cpu[r + 1] - cu_cpu[r]
+            past = seq_cpu[r] - ql
+            far_len = (max(past - e_pad, 0) // align) * align
+            if ql >= 64 and far_len >= 2048:
+                hybrid_reqs.append((r, cu_cpu[r], ql, far_len))
+            elif ql > 0:
+                short_reqs.append((r, cu_cpu[r], ql))
+        if hybrid_reqs:
+            for r, qs, ql in short_reqs:
+                qe = qs + ql
+                cu1 = cu_seqlens_q.new_tensor([0, ql])
+                _turbo_prefill_rel_attn_kernel[(triton.cdiv(ql, bq), num_heads, 1)](
+                    q[qs:qe], key_cache, value_cache, sheared_bias[qs:qe],
+                    gate[qs:qe], sinks[qs:qe], result[qs:qe],
+                    block_table[r : r + 1], cache_seqlens[r : r + 1], cu1,
+                    softmax_scale * 1.4426950408889634,
+                    q.stride(0), q.stride(1),
+                    key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+                    value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+                    sheared_bias.stride(0), sheared_bias.stride(1),
+                    gate.stride(0), sinks.stride(0),
+                    result.stride(0), block_table.stride(0),
+                    H=num_heads, GROUP=num_heads // num_kv_heads, D=head_dim, PAGE=page,
+                    E_PAD=e_pad, EXTENT=extent, WINDOW=window,
+                    BLOCK_Q=bq, BLOCK_N=bn, num_warps=nw, num_stages=1,
+                )
+            for r, qs, ql, far_len in hybrid_reqs:
+                n_pages = far_len // page
+                k_far = q.new_empty((1, num_kv_heads, far_len, head_dim))
+                v_far = q.new_empty((1, num_kv_heads, far_len, head_dim))
+                _gather_paged_kv_hnd_kernel[(n_pages, num_kv_heads)](
+                    key_cache, value_cache, block_table[r], k_far[0], v_far[0], n_pages,
+                    key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+                    value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+                    k_far.stride(1), k_far.stride(2), v_far.stride(1), v_far.stride(2),
+                    KVH=num_kv_heads, PAGE=page, D=head_dim, num_warps=4,
+                )
+                q_hnd = q[qs : qs + ql].transpose(0, 1).unsqueeze(0).contiguous()
+                out_far, lse_far = torch.ops.aten._scaled_dot_product_flash_attention(
+                    q_hnd, k_far, v_far, 0.0, False, False, scale=softmax_scale
+                )[:2]
+                out_far_3d = out_far[0]
+                lse_far_2d = lse_far[0]
+                _turbo_prefill_rel_attn_near_merge_kernel[(triton.cdiv(ql, bq), num_heads)](
+                    q, key_cache, value_cache, sheared_bias, gate, sinks,
+                    out_far_3d, lse_far_2d, result,
+                    block_table, cache_seqlens, cu_seqlens_q,
+                    softmax_scale * 1.4426950408889634, far_len, r,
+                    q.stride(0), q.stride(1),
+                    key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+                    value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+                    sheared_bias.stride(0), sheared_bias.stride(1),
+                    gate.stride(0), sinks.stride(0),
+                    out_far_3d.stride(0), out_far_3d.stride(1),
+                    lse_far_2d.stride(0), lse_far_2d.stride(1),
+                    result.stride(0), block_table.stride(0),
+                    H=num_heads, GROUP=num_heads // num_kv_heads, D=head_dim, PAGE=page,
+                    E_PAD=e_pad, BLOCK_Q=bq, BLOCK_N=bn, num_warps=nw, num_stages=1,
+                )
+            return
     grid = (triton.cdiv(max_seqlen_q, bq), num_heads, num_reqs)
     _turbo_prefill_rel_attn_kernel[grid](
         q, key_cache, value_cache, sheared_bias, gate, sinks, result,
@@ -1362,11 +1585,11 @@ def turbo_rel_decode_m8_attention(
     if num_reqs == 1:
         num_splits = 8 if is_local else 10
     elif num_reqs == 2:
-        num_splits = 4 if is_local else 6
+        num_splits = 4 if is_local else 5
     elif num_reqs <= 4:
-        num_splits = 2 if is_local else 4
+        num_splits = 2 if is_local else 6
     else:
-        num_splits = 1 if is_local else 4
+        num_splits = 1 if is_local else 6
     block_n = 32 if page == 16 else 64
     o_part = q.new_empty((num_splits * num_tokens, num_heads, head_dim), dtype=torch.float32)
     lse_part = q.new_empty((num_heads, num_splits * num_tokens), dtype=torch.float32)

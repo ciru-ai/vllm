@@ -629,15 +629,15 @@ class Inkling2LoopForConditionalGeneration(
                 and spec is not None
                 and spec.method == "dspark"
                 and 1 <= spec.num_speculative_tokens <= 7
-                and spec.draft_sample_method == "greedy"
+                and spec.draft_sample_method in ("greedy", "probabilistic")
                 and parallel.data_parallel_size == 1
             )
-            if vllm_config.scheduler_config.max_num_seqs != 1 or not (
+            if not (1 <= vllm_config.scheduler_config.max_num_seqs <= 8) or not (
                 plain_graph or target_graph
             ):
                 raise ValueError(
-                    "The ROCm Mini graph probe requires one sequence with plain "
-                    "decode or seven-token greedy DSpark"
+                    "The ROCm Mini graph path requires 1..8 sequences with plain "
+                    "decode or DSpark speculation"
                 )
         if spec is not None and (
             spec.method != "dspark"

@@ -1964,17 +1964,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         target_graph_ineligible = False
         if self.inkling_dspark_target_graph:
-            if batch_req_state is None or batch_req_state.has_prefill or num_reqs != 1:
+            if batch_req_state is None or batch_req_state.has_prefill or num_reqs < 1:
                 target_graph_ineligible = True
             else:
                 draft_counts = batch_req_state.num_draft_tokens_np
-                draft_count = 0 if draft_counts is None else int(draft_counts[0])
-                verify = num_toks == uniform_tok_count == (self.num_speculative_steps + 1) and draft_count == self.num_speculative_steps
-                plain = (
-                    self.inkling_dspark_phase_switch
-                    and num_toks == uniform_tok_count == 1
-                    and draft_count == 0
-                )
+                if num_reqs == 1:
+                    draft_count = 0 if draft_counts is None else int(draft_counts[0])
+                    verify = (
+                        uniform_tok_count is not None
+                        and 2 <= uniform_tok_count <= (self.num_speculative_steps + 1)
+                        and num_toks == uniform_tok_count
+                        and draft_count == (uniform_tok_count - 1)
+                    )
+                    plain = (
+                        self.inkling_dspark_phase_switch
+                        and num_toks == uniform_tok_count == 1
+                        and draft_count == 0
+                    )
+                else:
+                    verify = (
+                        uniform_tok_count is not None
+                        and 2 <= uniform_tok_count <= (self.num_speculative_steps + 1)
+                        and num_toks == num_reqs * uniform_tok_count
+                        and draft_counts is not None
+                        and bool((draft_counts[:num_reqs] == (uniform_tok_count - 1)).all())
+                    )
+                    plain = (
+                        self.inkling_dspark_phase_switch
+                        and uniform_tok_count == 1
+                        and num_toks == num_reqs
+                        and (draft_counts is None or bool((draft_counts[:num_reqs] == 0).all()))
+                    )
                 target_graph_ineligible = not (verify or plain)
         batch_desc, dp_sync_state = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
