@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified or added by Ciru for Inkling 2 Mini on AMD gfx1151.
 """Inkling2: platform-specific implementations live under `nvidia/`; configs,
 processing, quantization metadata and the DSpark speculator are shared."""
 
@@ -19,10 +20,22 @@ __all__ = [
 
 def __getattr__(name: str):
     if name == "Inkling2DSparkModel":
+        from vllm.platforms import current_platform
+
+        if current_platform.is_rocm():
+            from .amd import dspark
+
+            return dspark.Inkling2DSparkModel
         from .nvidia import dspark
 
         return dspark.Inkling2DSparkModel
     if name == "Inkling2LoopForConditionalGeneration":
+        from vllm.platforms import current_platform
+
+        if current_platform.is_rocm():
+            from .amd import model
+
+            return model.Inkling2LoopForConditionalGeneration
         from .nvidia import loop
 
         return loop.Inkling2LoopForConditionalGeneration

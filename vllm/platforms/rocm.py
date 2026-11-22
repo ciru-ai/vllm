@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified or added by Ciru for Inkling 2 Mini on AMD gfx1151.
 
 import importlib.metadata
 import os
@@ -642,6 +643,7 @@ class RocmPlatform(Platform):
     ]
 
     supported_quantization: list[str] = [
+        "inkling2",
         "awq",
         "auto_awq",
         "awq_marlin",  # will be overwritten with awq

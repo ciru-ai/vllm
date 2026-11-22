@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified or added by Ciru for Inkling 2 Mini on AMD gfx1151.
 """NOTE: Coding style guide for this file:
 This model runner is shared by all models: text and multimodal, generative
 and embedding, public and private. As a result, this file must only contain
@@ -18,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from collections.abc import Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -217,6 +219,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
+        self.inkling_dspark_target_graph = (
+            os.getenv("INKLING_AMD_DSPARK_TARGET_GRAPH") == "1"
+            and self.speculative_config is not None
+            and self.speculative_config.method == "dspark"
+            and "Inkling2LoopForConditionalGeneration"
+            in vllm_config.model_config.architectures
+        )
+        self.inkling_dspark_phase_switch = (
+            self.inkling_dspark_target_graph
+            and os.getenv("INKLING_AMD_DSPARK_PHASE_SWITCH") == "1"
+        )
+        self.inkling_dspark_draft_graph = (
+            os.getenv("INKLING_AMD_DSPARK_DRAFT_GRAPH") == "1"
+        )
+        self.inkling_copy_drafts = os.getenv("INKLING_AMD_DSPARK_COPY_DRAFT") == "1"
+        if self.inkling_copy_drafts and not (
+            self.inkling_dspark_target_graph
+            and self.speculative_config.draft_sample_method == "greedy"
+            and 1 <= self.speculative_config.num_speculative_tokens <= 7
+            and self.speculative_config.rejection_sample_method == "standard"
+            and not self.speculative_config.enable_adaptive_verification
+            and self.scheduler_config.max_num_seqs == 1
+            and self.parallel_config.data_parallel_size == 1
+            and self.parallel_config.tensor_parallel_size == 1
+            and self.parallel_config.pipeline_parallel_size == 1
+            and self.parallel_config.prefill_context_parallel_size == 1
+            and self.parallel_config.decode_context_parallel_size == 1
+            and vllm_config.model_config.max_model_len <= 4096
+        ):
+            raise ValueError("Inkling copy drafts require the C1 greedy seven-draft graph")
         self._draft_workspace_lane = int(
             self.speculative_config is not None
             and self.speculative_config.uses_separate_workspace_lane
@@ -292,8 +324,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         num_prefill_lookahead = max(1, vllm_config.num_prefill_lookahead_tokens)
         use_dense_all_token_ids = (
-            self.speculative_config is not None
-            and self.speculative_config.speculator_config.prefer_dense_token_history
+            self.inkling_copy_drafts
+            or (
+                self.speculative_config is not None
+                and self.speculative_config.speculator_config.prefer_dense_token_history
+            )
         )
 
         # General request states.
@@ -846,7 +881,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.speculator is not None:
             # After set_attn, so the speculator can size its cudagraph mode
             # to its own attention support.
-            self.speculator.init_cudagraph_manager(cudagraph_mode)
+            self.speculator.init_cudagraph_manager(
+                CUDAGraphMode.NONE
+                if self.inkling_dspark_target_graph and not self.inkling_dspark_draft_graph
+                else cudagraph_mode
+            )
 
         allocate_fn = None
         if self.extensible_kv_cache is not None:
@@ -1214,7 +1253,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.kv_cache_config,
                         self.cudagraph_manager.capture_stream,
                     )
-                    if self.speculator is not None:
+                    if self.speculator is not None and (
+                        not self.inkling_dspark_target_graph
+                        or self.inkling_dspark_draft_graph
+                    ):
                         with self.draft_context():
                             self.speculator.capture()
                     if self.adaptive_verification is not None and not profile_only:
@@ -1921,6 +1963,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        target_graph_ineligible = False
+        if self.inkling_dspark_target_graph:
+            if batch_req_state is None or batch_req_state.has_prefill or num_reqs < 1:
+                target_graph_ineligible = True
+            else:
+                draft_counts = batch_req_state.num_draft_tokens_np
+                if num_reqs == 1:
+                    draft_count = 0 if draft_counts is None else int(draft_counts[0])
+                    verify = (
+                        uniform_tok_count is not None
+                        and 2 <= uniform_tok_count <= (self.num_speculative_steps + 1)
+                        and num_toks == uniform_tok_count
+                        and draft_count == (uniform_tok_count - 1)
+                    )
+                    plain = (
+                        self.inkling_dspark_phase_switch
+                        and num_toks == uniform_tok_count == 1
+                        and draft_count == 0
+                    )
+                else:
+                    verify = (
+                        uniform_tok_count is not None
+                        and 2 <= uniform_tok_count <= (self.num_speculative_steps + 1)
+                        and num_toks == num_reqs * uniform_tok_count
+                        and draft_counts is not None
+                        and bool((draft_counts[:num_reqs] == (uniform_tok_count - 1)).all())
+                    )
+                    plain = (
+                        self.inkling_dspark_phase_switch
+                        and uniform_tok_count == 1
+                        and num_toks == num_reqs
+                        and (draft_counts is None or bool((draft_counts[:num_reqs] == 0).all()))
+                    )
+                target_graph_ineligible = not (verify or plain)
         batch_desc, dp_sync_state = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
@@ -1929,7 +2005,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_size,
             self.dp_rank,
             max_query_len=max_query_len,
-            need_eager=is_profile or skip_compiled,
+            need_eager=is_profile or skip_compiled or target_graph_ineligible,
             num_active_loras=num_active_loras,
             parallel_config=self.parallel_config,
             allow_ubatching=(
@@ -2439,6 +2515,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     num_speculative_tokens=num_spec_tokens,
                     dp_sync_state=dp_sync_state,
                     mm_inputs=mm_inputs,
+                )
+            if (
+                self.inkling_copy_drafts
+                and input_batch.num_reqs == 1
+                and not input_batch.has_prefill
+                and grammar_output is None
+                and 1 <= num_spec_tokens <= 7
+            ):
+                from vllm.models.inkling2.amd.copy_drafts import replace_copy_drafts
+
+                replace_copy_drafts(
+                    self.req_states.all_token_ids.gpu,
+                    self.req_states.total_len.gpu,
+                    num_sampled,
+                    self.sampler.sampling_states.temperature.gpu,
+                    draft_tokens,
                 )
             if self.pcp_manager is not None:
                 self.pcp_manager.sync_drafts(

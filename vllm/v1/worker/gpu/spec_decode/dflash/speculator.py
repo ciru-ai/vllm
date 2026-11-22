@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified or added by Ciru for Inkling 2 Mini on AMD gfx1151.
 import copy
 from typing import Any
 
@@ -38,6 +39,7 @@ logger = init_logger(__name__)
 
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
+    _require_full_verify_for_graph = False
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         parallel_config = vllm_config.parallel_config
@@ -487,6 +489,25 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Every draft logits write goes through sample_draft.
         return True
 
+    def _requires_eager_query(
+        self,
+        input_batch: InputBatch,
+        num_speculative_tokens: int | None,
+        dummy_run: bool,
+        is_profile: bool,
+    ) -> bool:
+        return is_profile or (
+            self._require_full_verify_for_graph
+            and (
+                dummy_run
+                or input_batch.has_prefill
+                or input_batch.num_reqs < 1
+                or input_batch.num_tokens != input_batch.num_reqs * self.num_query_per_req
+                or input_batch.num_draft_tokens != input_batch.num_reqs * self.num_speculative_steps
+                or num_speculative_tokens != self.num_speculative_steps
+            )
+        )
+
     @torch.inference_mode()
     def propose(
         self,
@@ -635,7 +656,9 @@ class DFlashSpeculator(DraftModelSpeculator):
             uniform_token_count=self.num_query_per_req,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
-            need_eager=is_profile,
+            need_eager=self._requires_eager_query(
+                input_batch, num_speculative_tokens, dummy_run, is_profile
+            ),
             dp_sync_state=batch_sync,
             parallel_config=self.vllm_config.parallel_config,
         )

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified or added by Ciru for Inkling 2 Mini on AMD gfx1151.
 
 import copy
 import getpass
@@ -785,6 +786,19 @@ class VllmConfig:
         """
         max_num_seqs = self.scheduler_config.max_num_seqs
         speculative_config = self.speculative_config
+        if (
+            os.getenv("INKLING_AMD_DSPARK_PHASE_SWITCH") == "1"
+            and os.getenv("INKLING_AMD_DSPARK_TARGET_GRAPH") == "1"
+            and self.model_config is not None
+            and "Inkling2LoopForConditionalGeneration" in self.model_config.architectures
+            and speculative_config is not None
+            and speculative_config.method == "dspark"
+            and max_num_seqs == 1
+            and decode_query_len == 8
+        ):
+            # The phase policy alternates between no proposal and the seven
+            # native proposals for the same C1 request.
+            return {1: 1, 8: 1}
         num_new_sampled_tokens = decode_query_len - self.num_speculative_tokens
         if (
             speculative_config is None
