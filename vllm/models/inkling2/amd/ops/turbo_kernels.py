@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# Modified or added by Ciru for Inkling 2 Mini on AMD gfx1151.
 """Ciru gfx1151 turbo kernels for Inkling 2 Mini PP & TG on vLLM."""
 
 from typing import NamedTuple
@@ -17,6 +16,8 @@ from triton.language.extra.hip import libdevice as tl_hip_lib
 
 from vllm.v1.worker.gpu.sample.greedy_argmax import _argmax_finish
 from .coda_wmma_pretile import _c1_bf16_pair, _expand_c1_groups
+from .norm import _l2_clip
+from .sconv import _conv
 from .source_wmma_pretile import _finite_bf16, _unpack_e2m1
 
 # ============================================================================
@@ -49,8 +50,12 @@ def _source_wmma_turbo_kernel(
     TOKENS: gl.constexpr, FUSED: gl.constexpr, GATE: gl.constexpr, UP: gl.constexpr,
     M_TILE: gl.constexpr, USE_F16: gl.constexpr,
 ):
-    m = gl.program_id(0)
-    n = gl.program_id(1)
+    if M_TILE == 64:
+        n = gl.program_id(0)
+        m = gl.program_id(1)
+    else:
+        m = gl.program_id(0)
+        n = gl.program_id(1)
     if m * M_TILE >= gl.load(Padded):
         return
     expert = gl.load(Expert + m)
@@ -141,7 +146,8 @@ def source_wmma_turbo_projection(
     out = x.new_empty((*route_shape, n // 2 if gamma is not None else n))
     bm = plan.block_m
     ns = 2 if bm == 64 else 1
-    _source_wmma_turbo_kernel[(plan.expert_ids.numel(), n_tiles)](
+    grid = (n_tiles, plan.expert_ids.numel()) if bm == 64 else (plan.expert_ids.numel(), n_tiles)
+    _source_wmma_turbo_kernel[grid](
         x, bank.packed, bank.raw_scales, bank.outer_scales,
         plan.sorted_ids, plan.expert_ids, plan.padded_tokens, out, gamma,
         N=n, K=k, ROUTES=plan.num_tokens * plan.top_k,
@@ -234,79 +240,62 @@ def coda_wmma_prefill_m64(x, bank, plan, *, fused_activation=None):
 
 
 @gluon.jit
-def _mixed_wmma_tile_m64(
-    X, Packed, Raw, Outer, RowScale, Table, expert, rows, valid, n,
-    N: gl.constexpr, K: gl.constexpr, KIND: gl.constexpr,
-    MMA: gl.constexpr, A_LOAD: gl.constexpr,
-):
-    b_byte: gl.constexpr = gl.DistributedLinearLayout(
-        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]],
-        [[1, 0], [2, 0], [4, 0], [8, 0], [64, 0]],
-        [[16, 0], [32, 0]], [], [128, 32],
-    )
-    b_row = gl.arange(0, 128, gl.SliceLayout(1, b_byte))
-    a_cols = gl.arange(0, 64, gl.SliceLayout(0, A_LOAD))
-    byte_cols = gl.arange(0, 32, gl.SliceLayout(0, b_byte))
-    tile = (expert.to(gl.int64) * (N // 128) + n) * (K // 64)
-    if KIND == 0:
-        outer = gl.load(Outer + expert)
-    elif KIND == 2:
-        row = gl.load(RowScale + expert.to(gl.int64) * N + n * 128 + b_row).to(gl.float32)
-    acc = gl.zeros((64, 128), gl.float32, MMA)
-    for k in range(K // 64):
-        x = gl.load(X + rows[:, None] * K + k * 64 + a_cols[None, :], valid[:, None], 0)
-        packet_row = (tile + k) * 128 + b_row
-        packed = gl.load(Packed + packet_row[:, None] * 32 + byte_cols[None, :]).to(gl.uint32)
-        raw = gl.load(Raw + packet_row).to(gl.uint32)
-        if KIND == 0:
-            scale_byte = (raw[:, None] >> ((byte_cols[None, :] // 8) * 8)) & 255
-            scale_bits = ((scale_byte << 4) + (119 << 7)).to(gl.uint16)
-            scale = scale_bits.to(gl.bfloat16, bitcast=True).to(gl.float32)
-            low, high = _unpack_e2m1(packed)
-            low = _finite_bf16((low * scale) * outer)
-            high = _finite_bf16((high * scale) * outer)
-        elif KIND == 1:
-            scale_bits = (raw[:, None] >> ((byte_cols[None, :] // 16) * 16)).to(gl.uint16)
-            scale = scale_bits.to(gl.bfloat16, bitcast=True).to(gl.float32)
-            low = ((((packed & 15).to(gl.int32) ^ 8) - 8).to(gl.float32) * scale).to(gl.bfloat16, fp_downcast_rounding="rtne")
-            high = ((((packed >> 4).to(gl.int32) ^ 8) - 8).to(gl.float32) * scale).to(gl.bfloat16, fp_downcast_rounding="rtne")
-        else:
-            low, high = _c1_bf16_pair(packed, raw, row, Table, expert)
-        weights = gl.reshape(gl.join(low, high), (128, 64))
-        a = gl.convert_layout(x, gl.DotOperandLayout(0, MMA, 16))
-        b = gl.convert_layout(gl.permute(weights, (1, 0)), gl.DotOperandLayout(1, MMA, 16))
-        acc = wmma(a, b, acc)
-    return acc
-
-
-@gluon.jit
-def _mixed_wmma_prefill_m64(
+def _mixed_split_kind_m64_kernel(
     X, Packed, Raw, Outer, Kind, RowScale, Table, Sorted, Expert, Padded, Y, Gamma,
     N: gl.constexpr, K: gl.constexpr, ROUTES, TOKENS: gl.constexpr,
-    FITTED_KIND: gl.constexpr, FUSED: gl.constexpr, GATE: gl.constexpr, UP: gl.constexpr,
+    TARGET_KIND: gl.constexpr, FUSED: gl.constexpr, GATE: gl.constexpr, UP: gl.constexpr,
 ):
-    m = gl.program_id(0)
-    n = gl.program_id(1)
+    n = gl.program_id(0)
+    m = gl.program_id(1)
     if m * 64 >= gl.load(Padded):
         return
     expert = gl.load(Expert + m)
     if expert < 0:
         return
+    if gl.load(Kind + expert) != TARGET_KIND:
+        return
     mma: gl.constexpr = AMDWMMALayout(1, True, [[1, 0], [0, 1]])
     a_load: gl.constexpr = gl.BlockedLayout([1, 8], [8, 4], [2, 2], [0, 1])
+    out_layout: gl.constexpr = gl.BlockedLayout([1, 2], [2, 16], [2, 2], [1, 0])
+    b_byte: gl.constexpr = gl.DistributedLinearLayout(
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]],
+        [[1, 0], [2, 0], [4, 0], [8, 0], [64, 0]],
+        [[16, 0], [32, 0]], [], [128, 32],
+    )
     a_range = gl.arange(0, 64, gl.SliceLayout(1, a_load))
+    a_cols = gl.arange(0, 64, gl.SliceLayout(0, a_load))
+    b_row = gl.arange(0, 128, gl.SliceLayout(1, b_byte))
+    byte_cols = gl.arange(0, 32, gl.SliceLayout(0, b_byte))
     route = gl.load(Sorted + m * 64 + a_range).to(gl.int64)
     valid = (route >= 0) & (route < ROUTES)
     rows = route // TOKENS
-    if gl.load(Kind + expert) == 0:
-        acc = _mixed_wmma_tile_m64(
-            X, Packed, Raw, Outer, RowScale, Table, expert, rows, valid, n, N, K, 0, mma, a_load,
-        )
-    else:
-        acc = _mixed_wmma_tile_m64(
-            X, Packed, Raw, Outer, RowScale, Table, expert, rows, valid, n, N, K, FITTED_KIND, mma, a_load,
-        )
-    out_layout: gl.constexpr = gl.BlockedLayout([1, 2], [2, 16], [2, 2], [1, 0])
+    tile = (expert.to(gl.int64) * (N // 128) + n) * (K // 64)
+    if TARGET_KIND == 0:
+        outer = gl.load(Outer + expert)
+    elif TARGET_KIND == 2:
+        row_sc = gl.load(RowScale + expert.to(gl.int64) * N + n * 128 + b_row).to(gl.float32)
+    acc = gl.zeros((64, 128), gl.float32, mma)
+    for k in range(K // 64):
+        x = gl.load(X + rows[:, None] * K + k * 64 + a_cols[None, :], valid[:, None], 0).to(gl.float16)
+        packet_row = (tile + k) * 128 + b_row
+        packed = gl.load(Packed + packet_row[:, None] * 32 + byte_cols[None, :]).to(gl.uint32)
+        raw = gl.load(Raw + packet_row).to(gl.uint32)
+        if TARGET_KIND == 0:
+            scale_byte = (raw[:, None] >> ((byte_cols[None, :] // 8) * 8)) & 255
+            low, high = _unpack_e2m1_f16x2_scaled(packed, scale_byte)
+        elif TARGET_KIND == 1:
+            scale_bits = (raw[:, None] >> ((byte_cols[None, :] // 16) * 16)).to(gl.uint16)
+            scale = scale_bits.to(gl.bfloat16, bitcast=True).to(gl.float32)
+            low = ((((packed & 15).to(gl.int32) ^ 8) - 8).to(gl.float32) * scale).to(gl.float16)
+            high = ((((packed >> 4).to(gl.int32) ^ 8) - 8).to(gl.float32) * scale).to(gl.float16)
+        else:
+            low, high = _c1_f16_pair(packed, raw, row_sc, Table, expert)
+        weights = gl.reshape(gl.join(low, high), (128, 64))
+        a = gl.convert_layout(x, gl.DotOperandLayout(0, mma, 16))
+        b = gl.convert_layout(gl.permute(weights, (1, 0)), gl.DotOperandLayout(1, mma, 16))
+        acc = wmma(a, b, acc)
+    if TARGET_KIND == 0:
+        acc = acc * outer
     out_rows: gl.constexpr = gl.SliceLayout(1, out_layout)
     route = gl.convert_layout(route, out_rows)
     valid = gl.convert_layout(valid, out_rows)
@@ -337,13 +326,23 @@ def mixed_wmma_prefill_m64(x, bank, plan, *, fused_activation=None):
     if fused_activation is not None:
         gamma, gate_cap, up_cap = fused_activation
     out = x.new_empty((*route_shape, n // 2 if gamma is not None else n))
-    _mixed_wmma_prefill_m64[(plan.expert_ids.numel(), n_tiles)](
+    grid = (n_tiles, plan.expert_ids.numel())
+    routes = plan.num_tokens * plan.top_k
+    tokens = plan.top_k if x.ndim == 2 else 1
+    _mixed_split_kind_m64_kernel[grid](
         x, bank.packed, bank.raw_scales, bank.outer_scales, bank.kind,
         bank.row_scales, bank.table,
         plan.sorted_ids, plan.expert_ids, plan.padded_tokens, out, gamma,
-        N=n, K=k, ROUTES=plan.num_tokens * plan.top_k,
-        TOKENS=plan.top_k if x.ndim == 2 else 1, FITTED_KIND=bank.fitted_kind,
-        FUSED=gamma is not None, GATE=gate_cap, UP=up_cap,
+        N=n, K=k, ROUTES=routes, TOKENS=tokens,
+        TARGET_KIND=0, FUSED=gamma is not None, GATE=gate_cap, UP=up_cap,
+        num_warps=4, num_stages=2, enable_fp_fusion=False,
+    )
+    _mixed_split_kind_m64_kernel[grid](
+        x, bank.packed, bank.raw_scales, bank.outer_scales, bank.kind,
+        bank.row_scales, bank.table,
+        plan.sorted_ids, plan.expert_ids, plan.padded_tokens, out, gamma,
+        N=n, K=k, ROUTES=routes, TOKENS=tokens,
+        TARGET_KIND=bank.fitted_kind, FUSED=gamma is not None, GATE=gate_cap, UP=up_cap,
         num_warps=4, num_stages=2, enable_fp_fusion=False,
     )
     return out
@@ -373,8 +372,8 @@ def _turbo_prefill_rel_attn_kernel(
     E_PAD: tl.constexpr, EXTENT: tl.constexpr, WINDOW: tl.constexpr,
     BLOCK_Q: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
-    q_block = tl.program_id(0)
-    head = tl.program_id(1)
+    head = tl.program_id(0)
+    q_block = tl.program_id(1)
     req = tl.program_id(2)
     kv_head = head // GROUP
 
@@ -389,20 +388,20 @@ def _turbo_prefill_rel_attn_kernel(
     q_offs = tl.arange(0, BLOCK_Q)
     q_idx = q0 + q_offs
     row_valid = q_idx < q_len
-    token = (q_start + q_idx).to(tl.int64)
     d = tl.arange(0, D)
 
-    q = tl.load(
-        Q + token[:, None] * stride_qt + head * stride_qh + d[None, :],
-        row_valid[:, None], other=0.0,
-    )
+    tok0 = (q_start + q0).to(tl.int64)
+    q_base = Q + tok0 * stride_qt + head.to(tl.int64) * stride_qh
+    q = tl.load(q_base + q_offs[:, None] * stride_qt + d[None, :], row_valid[:, None], other=0.0)
+    q_scaled = (q.to(tl.float32) * scale_log2).to(tl.bfloat16)
+
     pos = past + q_idx
     first_pos = past + q0
     hi = tl.minimum(past + q0 + BLOCK_Q, seq_len)
 
     table = BlockTable + req * stride_table
-    k_head_base = K + kv_head * stride_kh
-    v_head_base = V + kv_head * stride_vh
+    k_head_base = K + kv_head.to(tl.int64) * stride_kh
+    v_head_base = V + kv_head.to(tl.int64) * stride_vh
     n_offs = tl.arange(0, BLOCK_N)
 
     m_i = tl.full([BLOCK_Q], float("-inf"), tl.float32)
@@ -412,7 +411,6 @@ def _turbo_prefill_rel_attn_kernel(
     end_block = tl.cdiv(hi, BLOCK_N)
 
     if WINDOW < 0:
-        q_scaled = (q.to(tl.float32) * scale_log2).to(tl.bfloat16)
         first_bias_key = first_pos - E_PAD
         near_start_block = tl.maximum(first_bias_key, 0) // BLOCK_N
         for blk in range(0, near_start_block):
@@ -442,9 +440,10 @@ def _turbo_prefill_rel_attn_kernel(
         lo = tl.maximum(first_pos - WINDOW, 0) // BLOCK_N * BLOCK_N
         near_start_block = lo // BLOCK_N
 
-    tile_end = tl.minimum((q_idx // 128 + 1) * 128, q_len)
-    key0 = tl.cdiv(past + tile_end, 128) * 128 - E_PAD
-    bias_rows = Bias + token * stride_bt + head * stride_bh - key0
+    # BLOCK_Q divides 128, so all rows in this tile share one scalar key0 and bias base pointer.
+    tile_end_s = tl.minimum((q0 // 128 + 1) * 128, q_len)
+    key0_s = tl.cdiv(past + tile_end_s, 128) * 128 - E_PAD
+    bias_base = Bias + tok0 * stride_bt + head.to(tl.int64) * stride_bh
 
     for blk in range(near_start_block, end_block):
         key_begin = blk * BLOCK_N
@@ -466,13 +465,14 @@ def _turbo_prefill_rel_attn_kernel(
                 k_head_base + pg[:, None] * stride_kb + sl[:, None] * stride_kp + d[None, :],
                 key_valid[:, None], other=0.0,
             )
-        s = tl.dot(q, tl.trans(k)) * scale_log2
+        s = tl.dot(q_scaled, tl.trans(k))
         dist = pos[:, None] - keys[None, :]
         valid = row_valid[:, None] & key_valid[None, :] & (dist >= 0)
         if WINDOW >= 0:
             valid &= dist <= WINDOW
-        in_table = valid & (keys[None, :] >= key0[:, None])
-        bias = tl.load(bias_rows[:, None] + keys[None, :], in_table, other=0.0)
+        b_col = keys - key0_s
+        in_table = valid & (b_col[None, :] >= 0)
+        bias = tl.load(bias_base + q_offs[:, None] * stride_bt + b_col[None, :], in_table, other=0.0)
         s = s + bias.to(tl.float32) * 1.4426950408889634
         s = tl.where(valid, s, float("-inf"))
         m_new = tl.maximum(m_i, tl.max(s, 1))
@@ -496,11 +496,11 @@ def _turbo_prefill_rel_attn_kernel(
     has_keys = l_i > 0.0
     out = acc / tl.where(has_keys, l_i, 1.0)[:, None]
     lse_e = tl.where(has_keys, (m_i + tl.math.log2(l_i)) * 0.6931471805599453, float("-inf"))
-    gate = tl.load(Gate + token[:, None] * stride_gate + head * D + d[None, :], row_valid[:, None], other=0.0).to(tl.float32)
-    sink = tl.load(Sink + token * stride_sink + head, row_valid, other=0.0).to(tl.float32)
+    gate = tl.load(Gate + tok0 * stride_gate + q_offs[:, None] * stride_gate + head * D + d[None, :], row_valid[:, None], other=0.0).to(tl.float32)
+    sink = tl.load(Sink + tok0 * stride_sink + q_offs * stride_sink + head, row_valid, other=0.0).to(tl.float32)
     y = out * _turbo_sigmoid(gate) * _turbo_sigmoid(lse_e - sink)[:, None]
     tl.store(
-        Result + token[:, None] * stride_res + head * D + d[None, :],
+        Result + tok0 * stride_res + q_offs[:, None] * stride_res + head * D + d[None, :],
         y.to(Result.dtype.element_ty),
         row_valid[:, None],
     )
@@ -547,8 +547,8 @@ def _turbo_prefill_rel_attn_near_merge_kernel(
     E_PAD: tl.constexpr,
     BLOCK_Q: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
-    q_block = tl.program_id(0)
-    head = tl.program_id(1)
+    head = tl.program_id(0)
+    q_block = tl.program_id(1)
     kv_head = head // GROUP
 
     q_start = tl.load(CuSeqlensQ + req_idx)
@@ -562,19 +562,18 @@ def _turbo_prefill_rel_attn_near_merge_kernel(
     q_offs = tl.arange(0, BLOCK_Q)
     q_idx = q0 + q_offs
     row_valid = q_idx < q_len
-    token = (q_start + q_idx).to(tl.int64)
     d = tl.arange(0, D)
 
-    q = tl.load(
-        Q + token[:, None] * stride_qt + head * stride_qh + d[None, :],
-        row_valid[:, None], other=0.0,
-    )
+    tok0 = (q_start + q0).to(tl.int64)
+    q_base = Q + tok0 * stride_qt + head.to(tl.int64) * stride_qh
+    q = tl.load(q_base + q_offs[:, None] * stride_qt + d[None, :], row_valid[:, None], other=0.0)
+    q_scaled = (q.to(tl.float32) * scale_log2).to(tl.bfloat16)
     pos = past + q_idx
     hi = tl.minimum(past + q0 + BLOCK_Q, seq_len)
 
     table = BlockTable + req_idx * stride_table
-    k_head_base = K + kv_head * stride_kh
-    v_head_base = V + kv_head * stride_vh
+    k_head_base = K + kv_head.to(tl.int64) * stride_kh
+    v_head_base = V + kv_head.to(tl.int64) * stride_vh
     n_offs = tl.arange(0, BLOCK_N)
 
     lse_far = tl.load(
@@ -592,9 +591,9 @@ def _turbo_prefill_rel_attn_near_merge_kernel(
     near_start_block = far_len // BLOCK_N
     end_block = tl.cdiv(hi, BLOCK_N)
 
-    tile_end = tl.minimum((q_idx // 128 + 1) * 128, q_len)
-    key0 = tl.cdiv(past + tile_end, 128) * 128 - E_PAD
-    bias_rows = Bias + token * stride_bt + head * stride_bh - key0
+    tile_end_s = tl.minimum((q0 // 128 + 1) * 128, q_len)
+    key0_s = tl.cdiv(past + tile_end_s, 128) * 128 - E_PAD
+    bias_base = Bias + tok0 * stride_bt + head.to(tl.int64) * stride_bh
 
     for blk in range(near_start_block, end_block):
         key_begin = blk * BLOCK_N
@@ -616,11 +615,12 @@ def _turbo_prefill_rel_attn_near_merge_kernel(
                 k_head_base + pg[:, None] * stride_kb + sl[:, None] * stride_kp + d[None, :],
                 key_valid[:, None], other=0.0,
             )
-        s = tl.dot(q, tl.trans(k)) * scale_log2
+        s = tl.dot(q_scaled, tl.trans(k))
         dist = pos[:, None] - keys[None, :]
         valid = row_valid[:, None] & key_valid[None, :] & (dist >= 0)
-        in_table = valid & (keys[None, :] >= key0[:, None])
-        bias = tl.load(bias_rows[:, None] + keys[None, :], in_table, other=0.0)
+        b_col = keys - key0_s
+        in_table = valid & (b_col[None, :] >= 0)
+        bias = tl.load(bias_base + q_offs[:, None] * stride_bt + b_col[None, :], in_table, other=0.0)
         s = s + bias.to(tl.float32) * 1.4426950408889634
         s = tl.where(valid, s, float("-inf"))
         m_new = tl.maximum(m_i, tl.max(s, 1))
@@ -644,11 +644,11 @@ def _turbo_prefill_rel_attn_near_merge_kernel(
     has_keys = l_i > 0.0
     out = acc / tl.where(has_keys, l_i, 1.0)[:, None]
     lse_e = tl.where(has_keys, (m_i + tl.math.log2(l_i)) * 0.6931471805599453, float("-inf"))
-    gate = tl.load(Gate + token[:, None] * stride_gate + head * D + d[None, :], row_valid[:, None], other=0.0).to(tl.float32)
-    sink = tl.load(Sink + token * stride_sink + head, row_valid, other=0.0).to(tl.float32)
+    gate = tl.load(Gate + tok0 * stride_gate + q_offs[:, None] * stride_gate + head * D + d[None, :], row_valid[:, None], other=0.0).to(tl.float32)
+    sink = tl.load(Sink + tok0 * stride_sink + q_offs * stride_sink + head, row_valid, other=0.0).to(tl.float32)
     y = out * _turbo_sigmoid(gate) * _turbo_sigmoid(lse_e - sink)[:, None]
     tl.store(
-        Result + token[:, None] * stride_res + head * D + d[None, :],
+        Result + tok0 * stride_res + q_offs[:, None] * stride_res + head * D + d[None, :],
         y.to(Result.dtype.element_ty),
         row_valid[:, None],
     )
@@ -671,7 +671,8 @@ def turbo_gated_rel_attention(
     num_reqs = cache_seqlens.shape[0]
     e_pad = sheared_bias.shape[2]
     extent = e_pad - 256
-    bq, bn, nw = 64, 32, 4
+    # BLOCK_N=16 stays <= PAGE (16/32/64) for scalar page_id + contiguous loads and higher occupancy (1.44-1.70x faster on gfx1151).
+    bq, bn, nw = 64, (16 if page >= 16 else 32), 4
     # Hybrid AOTriton-Far + Triton-Near for long-context global prefill (>=16K past):
     # eliminates the 32K->64K MALL spill cliff (2.40x faster at 64K, 0.0000 BF16 max err).
     if (
@@ -698,7 +699,7 @@ def turbo_gated_rel_attention(
             for r, qs, ql in short_reqs:
                 qe = qs + ql
                 cu1 = cu_seqlens_q.new_tensor([0, ql])
-                _turbo_prefill_rel_attn_kernel[(triton.cdiv(ql, bq), num_heads, 1)](
+                _turbo_prefill_rel_attn_kernel[(num_heads, triton.cdiv(ql, bq), 1)](
                     q[qs:qe], key_cache, value_cache, sheared_bias[qs:qe],
                     gate[qs:qe], sinks[qs:qe], result[qs:qe],
                     block_table[r : r + 1], cache_seqlens[r : r + 1], cu1,
@@ -730,7 +731,7 @@ def turbo_gated_rel_attention(
                 )[:2]
                 out_far_3d = out_far[0]
                 lse_far_2d = lse_far[0]
-                _turbo_prefill_rel_attn_near_merge_kernel[(triton.cdiv(ql, bq), num_heads)](
+                _turbo_prefill_rel_attn_near_merge_kernel[(num_heads, triton.cdiv(ql, bq))](
                     q, key_cache, value_cache, sheared_bias, gate, sinks,
                     out_far_3d, lse_far_2d, result,
                     block_table, cache_seqlens, cu_seqlens_q,
@@ -747,7 +748,7 @@ def turbo_gated_rel_attention(
                     E_PAD=e_pad, BLOCK_Q=bq, BLOCK_N=bn, num_warps=nw, num_stages=1,
                 )
             return
-    grid = (triton.cdiv(max_seqlen_q, bq), num_heads, num_reqs)
+    grid = (num_heads, triton.cdiv(max_seqlen_q, bq), num_reqs)
     _turbo_prefill_rel_attn_kernel[grid](
         q, key_cache, value_cache, sheared_bias, gate, sinks, result,
         block_table, cache_seqlens, cu_seqlens_q,
@@ -1074,6 +1075,58 @@ def _w6_wmma_qkv_batched_f16_kernel(
     gl.store(Y + out_row[:, None] * N + tile_n * 128 + out_col[None, :], val, out_row[:, None] < M)
 
 
+@gluon.jit
+def _w6_wmma_splitk_batched_kernel(
+    X, P4, P2, Scales, Partial, M,
+    N: gl.constexpr, K: gl.constexpr, M_TILE: gl.constexpr, SPLITS: gl.constexpr,
+):
+    tile_n = gl.program_id(0)
+    tile_m = gl.program_id(1)
+    sp = gl.program_id(2)
+    k_tiles: gl.constexpr = K // 64
+    k_per_sp: gl.constexpr = k_tiles // SPLITS
+    k_start = sp * k_per_sp
+    mma: gl.constexpr = AMDWMMALayout(1, True, [[0, 1], [0, 2]])
+    a_load: gl.constexpr = gl.BlockedLayout([1, 64], [16, 2], [1, 4], [0, 1])
+    out_layout: gl.constexpr = gl.DistributedLinearLayout(
+        [[0, 1], [0, 4], [0, 8], [0, 64]],
+        [[1, 0], [2, 0], [4, 0], [8, 0], [0, 2]],
+        [[0, 16], [0, 32]], [], [16, 128],
+    )
+    b_byte: gl.constexpr = gl.DistributedLinearLayout(
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]],
+        [[1, 0], [2, 0], [4, 0], [8, 0], [64, 0]],
+        [[16, 0], [32, 0]], [], [128, 32],
+    )
+    a_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, a_load))
+    a_col = gl.arange(0, 64, gl.SliceLayout(0, a_load))
+    b_row = gl.arange(0, 128, gl.SliceLayout(1, b_byte))
+    b_col = gl.arange(0, 32, gl.SliceLayout(0, b_byte))
+    acc = gl.zeros((M_TILE, 128), gl.float32, mma)
+    for dk in range(k_per_sp):
+        kt = k_start + dk
+        x = gl.load(X + a_row[:, None] * K + (kt * 64 + a_col[None, :]), a_row[:, None] < M, 0).to(gl.float16)
+        tidx = (tile_n * k_tiles + kt) * 128 + b_row
+        p4 = gl.load(P4 + tidx[:, None] * 32 + b_col[None, :]).to(gl.uint32)
+        p2_word = gl.load(P2 + tidx[:, None] * 4 + (b_col[None, :] // 8))
+        shift = (b_col[None, :] & 7) * 4
+        h2_pair = (p2_word >> shift) & 15
+        sc = gl.load(Scales + tidx)
+        lo_q = (((p4 & 15) | ((h2_pair & 3) << 4)).to(gl.int32) - 32).to(gl.float16) * sc[:, None]
+        hi_q = (((p4 >> 4) | ((h2_pair >> 2) << 4)).to(gl.int32) - 32).to(gl.float16) * sc[:, None]
+        w = gl.reshape(gl.join(lo_q, hi_q), (128, 64))
+        a = gl.convert_layout(x, gl.DotOperandLayout(0, mma, 16))
+        b = gl.convert_layout(gl.permute(w, (1, 0)), gl.DotOperandLayout(1, mma, 16))
+        acc = wmma(a, b, acc)
+    out_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, out_layout))
+    out_col = gl.arange(0, 128, gl.SliceLayout(0, out_layout))
+    val = gl.convert_layout(acc, out_layout)
+    gl.store(
+        Partial + (sp * M + out_row[:, None]) * N + tile_n * 128 + out_col[None, :],
+        val, out_row[:, None] < M,
+    )
+
+
 def w6_wmma_linear(
     x: torch.Tensor, weight: W6WmmaWeight, *,
     out_dtype: torch.dtype = torch.bfloat16, soft_cap: float = 0.0, splits: int = 1,
@@ -1081,7 +1134,22 @@ def w6_wmma_linear(
     m, k = x.shape
     n_pad = weight.padded_out
     out = x.new_empty((m, n_pad), dtype=out_dtype)
-    if m > 16:
+    if (
+        m > 16
+        and splits > 1
+        and out_dtype == torch.bfloat16
+        and soft_cap == 0.0
+        and (k // 64) % splits == 0
+    ):
+        partial = torch.empty((splits, m, n_pad), dtype=torch.float32, device=x.device)
+        _w6_wmma_splitk_batched_kernel[(n_pad // 128, triton.cdiv(m, 16), splits)](
+            x.contiguous(), weight.p4, weight.p2, weight.scales, partial, m,
+            N=n_pad, K=k, M_TILE=16, SPLITS=splits, num_warps=4, num_stages=2,
+        )
+        _reduce_splits_bf16[(triton.cdiv(m * n_pad, 256),)](
+            partial, out, m * n_pad, splits, 256, num_warps=4,
+        )
+    elif m > 16:
         bm = 32 if m <= 32 else 64
         _w6_wmma_batched_f16_kernel[(n_pad // 128, triton.cdiv(m, bm))](
             x.contiguous(), weight.p4, weight.p2, weight.scales, out, m,
@@ -1115,12 +1183,12 @@ def w6_wmma_qkv_linear(
     n_pad = weight.padded_out
     out = x_q.new_empty((m, n_pad), dtype=torch.bfloat16)
     if m > 16:
-        bm = 32 if m <= 32 else 64
+        bm = 32
         _w6_wmma_qkv_batched_f16_kernel[(n_pad // 128, triton.cdiv(m, bm))](
             x_q.contiguous(), x_k.contiguous(), x_v.contiguous(),
             weight.p4, weight.p2, weight.scales, out, m,
             Q_TILES=q_pad // 128, K_TILES_END=k_end // 128,
-            N=n_pad, K=k, M_TILE=bm, num_warps=4, num_stages=1,
+            N=n_pad, K=k, M_TILE=bm, num_warps=4, num_stages=2,
         )
     else:
         _w6_wmma_qkv_m8_kernel[(n_pad // 128,)](
@@ -1273,13 +1341,71 @@ def _w4_wmma_batched_f16_kernel(
     gl.store(Y + out_row[:, None] * N + tile_n * 128 + out_col[None, :], val, out_row[:, None] < M)
 
 
+@gluon.jit
+def _w4_wmma_splitk_kernel(
+    X, Packed, Scales, Partial, M,
+    N: gl.constexpr, K: gl.constexpr, M_TILE: gl.constexpr, SPLITS: gl.constexpr,
+):
+    tile_n = gl.program_id(0)
+    tile_m = gl.program_id(1)
+    sp = gl.program_id(2)
+    k_tiles: gl.constexpr = K // 64
+    k_per_sp: gl.constexpr = k_tiles // SPLITS
+    k_start = sp * k_per_sp
+    mma: gl.constexpr = AMDWMMALayout(1, True, [[0, 1], [0, 2]])
+    a_load: gl.constexpr = gl.BlockedLayout([1, 64], [16, 2], [1, 4], [0, 1])
+    out_layout: gl.constexpr = gl.DistributedLinearLayout(
+        [[0, 1], [0, 4], [0, 8], [0, 64]],
+        [[1, 0], [2, 0], [4, 0], [8, 0], [0, 2]],
+        [[0, 16], [0, 32]], [], [16, 128],
+    )
+    b_byte: gl.constexpr = gl.DistributedLinearLayout(
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]],
+        [[1, 0], [2, 0], [4, 0], [8, 0], [64, 0]],
+        [[16, 0], [32, 0]], [], [128, 32],
+    )
+    a_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, a_load))
+    a_col = gl.arange(0, 64, gl.SliceLayout(0, a_load))
+    b_row = gl.arange(0, 128, gl.SliceLayout(1, b_byte))
+    b_col = gl.arange(0, 32, gl.SliceLayout(0, b_byte))
+    acc = gl.zeros((M_TILE, 128), gl.float32, mma)
+    for dk in range(k_per_sp):
+        kt = k_start + dk
+        x = gl.load(X + a_row[:, None] * K + (kt * 64 + a_col[None, :]), a_row[:, None] < M, 0).to(gl.float16)
+        tidx = (tile_n * k_tiles + kt) * 128 + b_row
+        packed = gl.load(Packed + tidx[:, None] * 32 + b_col[None, :]).to(gl.uint32)
+        sc = gl.load(Scales + tidx)
+        lo = ((packed & 15).to(gl.int32) - 8).to(gl.float16) * sc[:, None]
+        hi = ((packed >> 4).to(gl.int32) - 8).to(gl.float16) * sc[:, None]
+        w = gl.reshape(gl.join(lo, hi), (128, 64))
+        a = gl.convert_layout(x, gl.DotOperandLayout(0, mma, 16))
+        b = gl.convert_layout(gl.permute(w, (1, 0)), gl.DotOperandLayout(1, mma, 16))
+        acc = wmma(a, b, acc)
+    out_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, out_layout))
+    out_col = gl.arange(0, 128, gl.SliceLayout(0, out_layout))
+    val = gl.convert_layout(acc, out_layout)
+    gl.store(
+        Partial + (sp * M + out_row[:, None]) * N + tile_n * 128 + out_col[None, :],
+        val, out_row[:, None] < M,
+    )
+
+
 def w4_wmma_linear(
     x: torch.Tensor, weight: W4WmmaWeight, *, bias: torch.Tensor | None = None, splits: int = 1,
 ) -> torch.Tensor:
     m, k = x.shape
     n_pad = weight.padded_out
     out = x.new_empty((m, n_pad), dtype=torch.bfloat16)
-    if m > 16 or bias is not None:
+    if m > 16 and bias is None and splits > 1 and (k // 64) % splits == 0:
+        partial = torch.empty((splits, m, n_pad), dtype=torch.float32, device=x.device)
+        _w4_wmma_splitk_kernel[(n_pad // 128, triton.cdiv(m, 16), splits)](
+            x.contiguous(), weight.packed, weight.scales, partial, m,
+            N=n_pad, K=k, M_TILE=16, SPLITS=splits, num_warps=4, num_stages=2,
+        )
+        _reduce_splits_bf16[(triton.cdiv(m * n_pad, 256),)](
+            partial, out, m * n_pad, splits, 256, num_warps=4,
+        )
+    elif m > 16 or bias is not None:
         bm = 16 if m <= 16 else (32 if m <= 32 else 64)
         bias_arg = bias if bias is not None else out
         _w4_wmma_batched_f16_kernel[(n_pad // 128, triton.cdiv(m, bm))](
@@ -1420,7 +1546,7 @@ def topk_markov_argmax(
 
 
 # ============================================================================
-# 6. TURBO M=8 SPLIT-KV DECODE ATTENTION (1.80x FASTER AT 64K!)
+# 6. TURBO M=8 SPLIT-KV DECODE ATTENTION
 # ============================================================================
 
 @triton.jit
@@ -1510,7 +1636,7 @@ def _turbo_decode_m8_split_kernel(
 
     tile_end = tl.minimum((q_idx // 128 + 1) * 128, q_len)
     key0 = tl.cdiv(past + tile_end, 128) * 128 - E_PAD
-    bias_rows = Bias + token * stride_bt + head * stride_bh - key0
+    bias_rows = Bias + token * stride_bt + head.to(tl.int64) * stride_bh - key0
 
     for blk in range(near_start, n_end):
         key_begin = blk * BLOCK_N
@@ -1610,7 +1736,7 @@ def turbo_rel_decode_m8_attention(
 
 
 # ============================================================================
-# 7. FAST M=8 ROUTER (1.62x FASTER) & FAST LOOP CONTROLLER DOWN (1.61x)
+# 7. FAST M=8 ROUTER & LOOP CONTROLLER DOWN
 # ============================================================================
 
 @triton.jit
@@ -1728,10 +1854,10 @@ def _c1_f16_pair(packed, raw, row_scale, Table, expert):
     row = gl.convert_layout(row_scale, group_rows, assert_trivial=True)
     tag = (raw[:, None] >> (group[None, :] * 8)) & 255
     entries = gl.load(Table.to(gl.pointer_type(gl.uint32)) + expert * 256 + tag)
-    scale = entries.to(gl.uint16).to(gl.float16, bitcast=True).to(gl.float32)
-    offset = (entries >> 16).to(gl.uint16).to(gl.float16, bitcast=True).to(gl.float32)
-    scale = _expand_c1_groups(scale * row[:, None], packed.type.layout)
-    offset = _expand_c1_groups(offset * row[:, None], packed.type.layout)
+    scale = entries.to(gl.uint16).to(gl.float16, bitcast=True).to(gl.float32) * row[:, None]
+    offset = (entries >> 16).to(gl.uint16).to(gl.float16, bitcast=True).to(gl.float32) * row[:, None]
+    scale = _expand_c1_groups(scale, packed.type.layout)
+    offset = _expand_c1_groups(offset, packed.type.layout)
     low = ((packed & 15).to(gl.float32) * scale + offset).to(gl.float16)
     high = ((packed >> 4).to(gl.float32) * scale + offset).to(gl.float16)
     return low, high
@@ -1850,6 +1976,7 @@ def mixed_wmma_turbo_projection(x, bank, plan, *, fused_activation=None):
         gamma, gate_cap, up_cap = fused_activation
     out = x.new_empty((*route_shape, n // 2 if gamma is not None else n))
     bm = plan.block_m
+    ns = 2 if bm == 64 else 1
     _mixed_wmma_turbo_kernel[(plan.expert_ids.numel(), n_tiles)](
         x, bank.packed, bank.raw_scales, bank.outer_scales, bank.kind,
         bank.row_scales, bank.table,
@@ -1857,7 +1984,7 @@ def mixed_wmma_turbo_projection(x, bank, plan, *, fused_activation=None):
         N=n, K=k, ROUTES=plan.num_tokens * plan.top_k,
         TOKENS=plan.top_k if x.ndim == 2 else 1, FITTED_KIND=bank.fitted_kind,
         FUSED=gamma is not None, GATE=gate_cap, UP=up_cap, M_TILE=bm,
-        num_warps=4, num_stages=2 if bm == 64 else 1, enable_fp_fusion=False,
+        num_warps=4, num_stages=ns, enable_fp_fusion=False,
     )
     return out
 
@@ -1869,8 +1996,12 @@ def _coda_wmma_turbo_kernel(
     FUSED: gl.constexpr, GATE: gl.constexpr, UP: gl.constexpr,
     M_TILE: gl.constexpr,
 ):
-    m = gl.program_id(0)
-    n = gl.program_id(1)
+    if M_TILE == 64:
+        n = gl.program_id(0)
+        m = gl.program_id(1)
+    else:
+        m = gl.program_id(0)
+        n = gl.program_id(1)
     if m * M_TILE >= gl.load(Padded):
         return
     expert = gl.load(Expert + m)
@@ -1944,19 +2075,21 @@ def coda_wmma_turbo_projection(x, bank, plan, *, fused_activation=None):
         gamma, gate_cap, up_cap = fused_activation
     out = x.new_empty((*route_shape, n // 2 if gamma is not None else n))
     bm = plan.block_m
-    _coda_wmma_turbo_kernel[(plan.expert_ids.numel(), n_tiles)](
+    ns = 2 if bm == 64 else 1
+    grid = (n_tiles, plan.expert_ids.numel()) if bm == 64 else (plan.expert_ids.numel(), n_tiles)
+    _coda_wmma_turbo_kernel[grid](
         x, bank.packed, bank.tags, bank.row_scales, bank.table,
         plan.sorted_ids, plan.expert_ids, plan.padded_tokens, out, gamma,
         N=n, K=k, ROUTES=plan.num_tokens * plan.top_k,
         TOKENS=plan.top_k if x.ndim == 2 else 1,
         FUSED=gamma is not None, GATE=gate_cap, UP=up_cap, M_TILE=bm,
-        num_warps=4, num_stages=2 if bm == 64 else 1, enable_fp_fusion=False,
+        num_warps=4, num_stages=ns, enable_fp_fusion=False,
     )
     return out
 
 
 # ============================================================================
-# 9. FUSED PREFILL LOOP BLEND + RMSNORM (1.60x FASTER, SKIPS 212MB BMM!)
+# 9. FUSED LOOP BLEND + RMSNORM (BATCHED DECODE M=16..64 & PREFILL)
 # ============================================================================
 
 @triton.jit
@@ -1994,7 +2127,8 @@ def _fused_loop_blend_p1_kernel(
 @triton.jit
 def _fused_loop_blend_p2_kernel(
     Blended, PartialSumSq, NormWeight, Out, stride_w_s, T, norm_eps,
-    D: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr, N_DBLK: tl.constexpr,
+    D: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr,
+    N_DBLK: tl.constexpr, G_POW2: tl.constexpr,
 ):
     t_blk = tl.program_id(0)
     d_blk = tl.program_id(1)
@@ -2002,7 +2136,7 @@ def _fused_loop_blend_p2_kernel(
     t = (t_blk * BT + tl.arange(0, BT)).to(tl.int64)
     d = d_blk * BD + tl.arange(0, BD)
     t_mask = t < T
-    g = tl.arange(0, 16)
+    g = tl.arange(0, G_POW2)
     g_mask = g < N_DBLK
     psq = tl.load(
         PartialSumSq + (s * N_DBLK + g[:, None]) * T + t[None, :],
@@ -2039,16 +2173,457 @@ def fused_loop_prefill_blend(
     ):
         return None
     blended = message.new_empty(message.shape, dtype=torch.bfloat16)
-    partial_sum_sq = message.new_empty((streams, 9, t_len), dtype=torch.float32)
     out = message.new_empty(message.shape, dtype=torch.bfloat16)
-    bt = 16 if t_len <= 32 else 32
-    _fused_loop_blend_p1_kernel[(triton.cdiv(t_len, bt), 9, streams)](
+    if t_len <= 64:
+        n_dblk, d_per_blk, g_pow2 = 36, 64, 64
+        bt = 16 if t_len <= 16 else (32 if t_len <= 32 else 64)
+    else:
+        n_dblk, d_per_blk, g_pow2 = 9, 256, 16
+        bt = 32
+    partial_sum_sq = message.new_empty((streams, n_dblk, t_len), dtype=torch.float32)
+    _fused_loop_blend_p1_kernel[(triton.cdiv(t_len, bt), n_dblk, streams)](
         hidden, weight, dest, message, blended, partial_sum_sq,
         *dest.stride()[:2], *message.stride()[:2], t_len,
-        D=width, BT=bt, BD=64, D_PER_BLK=256, N_DBLK=9, num_warps=4,
+        D=width, BT=bt, BD=64, D_PER_BLK=d_per_blk, N_DBLK=n_dblk, num_warps=4,
     )
     _fused_loop_blend_p2_kernel[(triton.cdiv(t_len, bt), width // 128, streams)](
         blended, partial_sum_sq, norm_weight, out, norm_weight.stride(0), t_len, norm_eps,
-        D=width, BT=bt, BD=128, N_DBLK=9, num_warps=4,
+        D=width, BT=bt, BD=128, N_DBLK=n_dblk, G_POW2=g_pow2, num_warps=4,
+    )
+    return out
+
+
+# ============================================================================
+# 10. SPLIT CONTIGUOUS ATTENTION PROLOGUE (STRIDED [H,T+128,E] + SKIP-CACHE KV)
+# ============================================================================
+
+@triton.jit
+def _fast_qr_rel_strided_kernel(
+    Q, R, QScale, RScale, Tau, RelProj, QOut, RelOut,
+    SeqIdx, CuSeqlensQ, SeqLens,
+    T, stride_q, stride_r, stride_rel_t, stride_rel_h,
+    q_threshold, r_threshold, eps,
+    H: tl.constexpr, D: tl.constexpr, D_REL: tl.constexpr,
+    E: tl.constexpr, W: tl.constexpr, HAS_TAU: tl.constexpr,
+    BLOCK_H: tl.constexpr, BLOCK_E: tl.constexpr,
+):
+    t = tl.program_id(0).to(tl.int64)
+    if t >= T:
+        return
+    E_PAD: tl.constexpr = E + 256
+    heads = tl.arange(0, BLOCK_H)[:, None]
+    h_mask = heads < H
+    tau = tl.load(Tau + t) if HAS_TAU else 1.0
+
+    q_cols = tl.arange(0, D)[None, :]
+    q = _l2_clip(Q + t * stride_q, QScale, heads, q_cols, h_mask, q_threshold, eps, tau, HAS_TAU)
+    tl.store(QOut + t * H * D + heads * D + q_cols, q, h_mask)
+
+    r_cols = tl.arange(0, D_REL)[None, :]
+    r = _l2_clip(R + t * stride_r, RScale, heads, r_cols, h_mask, r_threshold, eps, tau, HAS_TAU)
+
+    seq = tl.load(SeqIdx + t)
+    q_start = tl.load(CuSeqlensQ + seq)
+    q_len = tl.load(CuSeqlensQ + seq + 1) - q_start
+    q_idx = t - q_start
+    pos = tl.load(SeqLens + seq) - q_len + q_idx
+    tile_end = tl.minimum((q_idx // 128 + 1) * 128, q_len)
+    diag = pos + E_PAD - tl.cdiv(pos - q_idx + tile_end, 128) * 128
+    diag = tl.minimum(tl.maximum(diag, E + 1), E_PAD - 1)
+    diag8 = diag // 8 * 8
+    table = RelProj + (diag - diag8) * (D_REL + 1) * W + E + 256 - diag8
+    e_idx = tl.arange(0, BLOCK_E)[None, :]
+    out_base = RelOut + t * stride_rel_t + heads.to(tl.int64) * stride_rel_h
+    for chunk in tl.static_range(E_PAD // BLOCK_E):
+        col = chunk * BLOCK_E + e_idx
+        proj = tl.load(table + tl.trans(r_cols) * W + col)
+        pad = tl.load(table + D_REL * W + col)
+        rel = tl.dot(r, proj) + pad.to(tl.float32)
+        tl.store(out_base + col, rel.to(RelOut.dtype.element_ty), h_mask)
+
+
+@triton.jit
+def _kv_conv_tile_skip_kernel(
+    k_ptr, v_ptr, wk_ptr, wv_ptr, dk_ptr, dv_ptr,
+    cache_ptr, key_cache_ptr, value_cache_ptr, kv_slot_ptr,
+    pos_ptr, seq_idx_ptr, slot_ptr, block_table_ptr, qstart_ptr,
+    T, stride_k, stride_v, stride_w0, stride_w1, stride_dk, stride_dv,
+    stride_c_blk, stride_c_h, stride_c_n,
+    stride_kv_blk, stride_kv_n, stride_kv_h, kv_block_size,
+    stride_bt, max_blocks, N, scale, clip_threshold, clip_eps, norm_eps,
+    W: tl.constexpr, D: tl.constexpr, DYNAMIC: tl.constexpr,
+    BT: tl.constexpr, SKIP_IDLE_CACHE: tl.constexpr,
+):
+    first = tl.program_id(0) * BT
+    tile_reads_cache = True
+    if SKIP_IDLE_CACHE:
+        last = tl.minimum(first + BT, T) - 1
+        tile_reads_cache = tl.load(qstart_ptr + last) > first - (W - 1)
+    toff = first + tl.arange(0, BT)
+    head = tl.program_id(1)
+    is_v = tl.program_id(2) == 1
+    d_idx = tl.arange(0, D)
+    coff = head * D + d_idx
+    t_mask = toff < T
+    if is_v:
+        x_ptr, w_ptr, dyn_ptr, stride_x, stride_dyn = v_ptr, wv_ptr, dv_ptr, stride_v, stride_dv
+    else:
+        x_ptr, w_ptr, dyn_ptr, stride_x, stride_dyn = k_ptr, wk_ptr, dk_ptr, stride_k, stride_dk
+    y = _conv(
+        x_ptr, stride_x, cache_ptr, head * stride_c_h + tl.program_id(2) * D + d_idx,
+        stride_c_blk, stride_c_n, N, w_ptr, stride_w0, stride_w1,
+        pos_ptr, seq_idx_ptr, slot_ptr, block_table_ptr, stride_bt, max_blocks,
+        qstart_ptr, scale, toff, coff, t_mask, d_idx < D,
+        W, dyn_ptr if DYNAMIC else None, stride_dyn, D,
+        SKIP_IDLE_CACHE=SKIP_IDLE_CACHE,
+        CACHE_FIRST=False,
+        tile_reads_cache=tile_reads_cache,
+    )
+    y = y.to(k_ptr.dtype.element_ty).to(tl.float32)
+    sum_sq = tl.sum(y * y, axis=1)
+    if is_v:
+        y = y * tl.rsqrt(tl.div_rn(sum_sq, D) + norm_eps)[:, None]
+        cache = value_cache_ptr
+    else:
+        norm = tl.where(sum_sq > 0, sum_sq * tl.rsqrt(sum_sq), 0.0)
+        y = y * tl.minimum(tl.div_rn(clip_threshold, norm + clip_eps), 1.0)[:, None]
+        cache = key_cache_ptr
+    kv_slot = tl.load(kv_slot_ptr + toff, mask=t_mask, other=-1)
+    safe = tl.maximum(kv_slot, 0)
+    dst = (
+        cache + (safe // kv_block_size)[:, None] * stride_kv_blk
+        + (safe % kv_block_size)[:, None] * stride_kv_n
+        + head * stride_kv_h + d_idx[None, :]
+    )
+    tl.store(dst, y.to(cache.dtype.element_ty), mask=(kv_slot >= 0)[:, None])
+
+
+def turbo_attention_prologue(
+    q: torch.Tensor, r: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    q_scale: torch.Tensor, r_scale: torch.Tensor, tau: torch.Tensor | None,
+    rel_proj: torch.Tensor, k_weight: torch.Tensor, v_weight: torch.Tensor,
+    k_dynamic: torch.Tensor | None, v_dynamic: torch.Tensor | None,
+    cache: torch.Tensor, positions: torch.Tensor, block_table: torch.Tensor,
+    seq_idx: torch.Tensor, slot_mapping: torch.Tensor, query_start: torch.Tensor,
+    key_cache: torch.Tensor, value_cache: torch.Tensor, kv_slot_mapping: torch.Tensor,
+    q_out: torch.Tensor, rel_out: torch.Tensor, cu_seqlens_q: torch.Tensor,
+    seq_lens: torch.Tensor, *,
+    clip_threshold: float, rel_threshold: float, norm_eps: float, clip_eps: float = 1e-6,
+) -> None:
+    num_tokens = kv_slot_mapping.shape[0]
+    num_heads, head_dim = key_cache.shape[2:]
+    num_q_heads, d_rel = r.shape[1:]
+    extent = rel_proj.shape[2] - 512
+    dynamic = k_dynamic is not None
+    if dynamic:
+        width = k_weight.shape[0]
+        dyn_strides = (k_dynamic.stride(0), v_dynamic.stride(0))
+    else:
+        width = k_weight.shape[1]
+        dyn_strides = (0, 0)
+    block_e = min(extent, 256)
+    _fast_qr_rel_strided_kernel[(num_tokens,)](
+        q, r, q_scale, r_scale, tau, rel_proj, q_out, rel_out,
+        seq_idx, cu_seqlens_q, seq_lens, num_tokens,
+        q.stride(0), r.stride(0), rel_out.stride(0), rel_out.stride(1),
+        clip_threshold, rel_threshold, clip_eps,
+        H=num_q_heads, D=head_dim, D_REL=d_rel, E=extent, W=rel_proj.shape[2],
+        HAS_TAU=tau is not None, BLOCK_H=max(triton.next_power_of_2(num_q_heads), 16),
+        BLOCK_E=block_e, num_warps=8, enable_fp_fusion=False,
+    )
+    prefill = num_tokens > 256
+    scale = (width * (2 if dynamic else 1) + 1) ** -0.5
+    if prefill:
+        from .hip_moe_prefill import hip_kv_conv_prefill
+
+        if hip_kv_conv_prefill(
+            k, v, k_weight, v_weight, k_dynamic, v_dynamic,
+            cache, key_cache, value_cache, kv_slot_mapping,
+            positions, seq_idx, slot_mapping, block_table, query_start,
+            num_tokens=num_tokens, num_heads=num_heads, head_dim=head_dim,
+            width=width, scale=scale, clip_threshold=clip_threshold,
+            clip_eps=clip_eps, norm_eps=norm_eps,
+        ):
+            return
+    bt = (64 if not dynamic else 16) if prefill else 4
+    _kv_conv_tile_skip_kernel[(triton.cdiv(num_tokens, bt), num_heads, 2)](
+        k, v, k_weight, v_weight,
+        k_dynamic if dynamic else k_weight,
+        v_dynamic if dynamic else v_weight,
+        cache, key_cache, value_cache, kv_slot_mapping,
+        positions, seq_idx, slot_mapping, block_table, query_start,
+        num_tokens, k.stride(0), v.stride(0), k_weight.stride(0), k_weight.stride(1),
+        *dyn_strides,
+        cache.stride(0), cache.stride(1), cache.stride(2),
+        key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+        key_cache.shape[1], block_table.stride(0), block_table.shape[1], cache.shape[2],
+        scale, clip_threshold, clip_eps, norm_eps,
+        W=width, D=head_dim, DYNAMIC=dynamic, BT=bt, SKIP_IDLE_CACHE=prefill,
+        num_warps=4, enable_fp_fusion=False,
+    )
+
+
+# ============================================================================
+# 10. PREFILL ROUTER BF16-WMMA->FP32 & ALL-IN-ONE FUSED LOOP CONTROLLER
+# ============================================================================
+
+@triton.jit
+def _router_prefill_bf16_to_fp32_kernel(
+    X, W, Bias, Score, Corrected,
+    T, K: tl.constexpr, N: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr,
+):
+    t_blk = tl.program_id(0)
+    t = t_blk * BT + tl.arange(0, BT)
+    t_mask = t < T
+    n = tl.arange(0, N)
+    acc = tl.zeros((BT, N), tl.float32)
+    for k0 in range(0, K, BK):
+        k = k0 + tl.arange(0, BK)
+        x = tl.load(X + t[:, None].to(tl.int64) * K + k[None, :], t_mask[:, None], other=0)
+        w = tl.load(W + n[None, :].to(tl.int64) * K + k[:, None])
+        acc = tl.dot(x, w, acc)
+    score = tl.div_rn(1.0, 1.0 + tl_hip_lib.exp(-acc))
+    bias = tl.load(Bias + n)
+    corr = score + bias[None, :]
+    tl.store(Score + t[:, None].to(tl.int64) * N + n[None, :], score, t_mask[:, None])
+    tl.store(Corrected + t[:, None].to(tl.int64) * N + n[None, :], corr, t_mask[:, None])
+
+
+def router_scores_prefill(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if (
+        not x.is_cuda
+        or x.ndim != 2
+        or x.shape[0] < 64
+        or x.shape[1] != 2304
+        or weight.shape != (128, 2304)
+        or bias.shape != (128,)
+        or x.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or bias.dtype != torch.float32
+        or not x.is_contiguous()
+        or not weight.is_contiguous()
+        or not bias.is_contiguous()
+    ):
+        return None
+    t_len = x.shape[0]
+    score = x.new_empty((t_len, 128), dtype=torch.float32)
+    corrected = x.new_empty((t_len, 128), dtype=torch.float32)
+    bt = 128 if t_len >= 512 else 64
+    nw = 8 if bt == 128 else 4
+    _router_prefill_bf16_to_fp32_kernel[(triton.cdiv(t_len, bt),)](
+        x, weight, bias, score, corrected, t_len, K=2304, N=128, BT=bt, BK=64, num_warps=nw,
+    )
+    return score, corrected
+
+
+@triton.jit
+def _fused_loop_allinone_kernel(
+    Dest, Msg, WdownT, Wup, NormW, Out,
+    sd_s, sd_t, sm_s, sm_t, sw_s,
+    T, norm_eps, D: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr,
+):
+    t_blk = tl.program_id(0)
+    s = tl.program_id(1).to(tl.int64)
+    t = (t_blk * BT + tl.arange(0, BT)).to(tl.int64)
+    t_mask = t < T
+    r = tl.arange(0, 64)
+    acc_d = tl.zeros((BT, 64), tl.float32)
+    acc_m = tl.zeros((BT, 64), tl.float32)
+    sq_d = tl.zeros((BT,), tl.float32)
+    sq_m = tl.zeros((BT,), tl.float32)
+    wd_base = WdownT + s * (2 * D * 64)
+    for k0 in range(0, D, BK):
+        k = k0 + tl.arange(0, BK)
+        d_val = tl.load(Dest + s * sd_s + t[:, None] * sd_t + k[None, :], t_mask[:, None], other=0.0)
+        m_val = tl.load(Msg + s * sm_s + t[:, None] * sm_t + k[None, :], t_mask[:, None], other=0.0)
+        sq_d += tl.sum(d_val * d_val, axis=1)
+        sq_m += tl.sum(m_val * m_val, axis=1)
+        wd = tl.load(wd_base + k[:, None] * 64 + r[None, :])
+        wm = tl.load(wd_base + (D + k[:, None]) * 64 + r[None, :])
+        acc_d += tl.dot(d_val.to(tl.bfloat16), wd)
+        acc_m += tl.dot(m_val.to(tl.bfloat16), wm)
+    rstd_d = tl_hip_lib.rsqrt(tl.div_rn(sq_d, D) + 1e-6)
+    rstd_m = tl_hip_lib.rsqrt(tl.div_rn(sq_m, D) + 1e-6)
+    hidden = (acc_d * rstd_d[:, None] + acc_m * rstd_m[:, None]).to(tl.bfloat16)
+
+    wu_base = Wup + s * (2 * D * 64)
+    sq_b = tl.zeros((BT,), tl.float32)
+    out_base = Out + (s * T + t[:, None]) * D
+    for k0 in range(0, D, BK):
+        k = k0 + tl.arange(0, BK)
+        wg = tl.load(wu_base + k[:, None] * 64 + r[None, :])
+        wf = tl.load(wu_base + (D + k[:, None]) * 64 + r[None, :])
+        gain = tl_hip_lib.tanh(tl.dot(hidden, tl.trans(wg)))
+        forget = tl_hip_lib.tanh(tl.dot(hidden, tl.trans(wf)))
+        d_val = tl.load(Dest + s * sd_s + t[:, None] * sd_t + k[None, :], t_mask[:, None], other=0.0)
+        m_val = tl.load(Msg + s * sm_s + t[:, None] * sm_t + k[None, :], t_mask[:, None], other=0.0)
+        b = (1.0 - forget) * d_val + gain * m_val
+        sq_b += tl.sum(b * b, axis=1)
+        tl.store(out_base + k[None, :], b.to(tl.bfloat16), t_mask[:, None])
+    rstd_b = tl_hip_lib.rsqrt(tl.div_rn(sq_b, D) + norm_eps)
+    nw_base = NormW + s * sw_s
+    for k0 in range(0, D, BK):
+        k = k0 + tl.arange(0, BK)
+        b = tl.load(out_base + k[None, :], t_mask[:, None], other=0.0).to(tl.float32)
+        nw = tl.load(nw_base + k).to(tl.float32)
+        tl.store(out_base + k[None, :], (b * rstd_b[:, None] * nw[None, :]).to(tl.bfloat16), t_mask[:, None])
+
+
+def fused_loop_allinone_prefill(
+    dest: torch.Tensor,
+    message: torch.Tensor,
+    down_weight_t: torch.Tensor,
+    up_weight: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+) -> torch.Tensor | None:
+    from .loop import _packed_rows
+
+    if not _packed_rows(dest, message):
+        return None
+    streams, t_len, width = message.shape
+    if (
+        t_len < 64
+        or width != 2304
+        or down_weight_t.shape != (streams, 2 * width, 64)
+        or up_weight.shape != (streams, 2 * width, 64)
+        or down_weight_t.dtype != torch.bfloat16
+        or up_weight.dtype != torch.bfloat16
+        or not down_weight_t.is_contiguous()
+        or not up_weight.is_contiguous()
+        or norm_weight.shape != (streams, width)
+        or norm_weight.stride(-1) != 1
+    ):
+        return None
+    out = message.new_empty(message.shape, dtype=torch.bfloat16)
+    bt = 16
+    _fused_loop_allinone_kernel[(triton.cdiv(t_len, bt), streams)](
+        dest, message, down_weight_t, up_weight, norm_weight, out,
+        *dest.stride()[:2], *message.stride()[:2], norm_weight.stride(0),
+        t_len, norm_eps, D=width, BT=bt, BK=64, num_warps=4,
+    )
+    return out
+
+
+@triton.jit
+def _turbo_fast_tanh(x):
+    ax = tl.abs(x)
+    e = tl.math.exp2(-2.8853900817779268 * ax)
+    t = (1.0 - e) / (1.0 + e)
+    return tl.where(x >= 0.0, t, -t)
+
+
+@triton.jit
+def _fused_loop_zeromat_kernel(
+    Dest, Bank0, Bank1, Coeffs, WdownT, Wup, NormW, Out,
+    sd_s, sd_t, sb0, sb1, sc_s, sw_s,
+    T, norm_eps, D: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr,
+):
+    # Grid=(streams, cdiv(T, BT)) keeps all S streams for the same token block
+    # co-scheduled across CUs for high L2/MALL reuse of Dest, Bank0, and Bank1.
+    s = tl.program_id(0).to(tl.int64)
+    t_blk = tl.program_id(1)
+    t = (t_blk * BT + tl.arange(0, BT)).to(tl.int64)
+    t_mask = t < T
+    r = tl.arange(0, 64)
+
+    c0 = tl.load(Coeffs + s * sc_s + t * 2 + 0, t_mask, other=0.0)
+    c1 = tl.load(Coeffs + s * sc_s + t * 2 + 1, t_mask, other=0.0)
+
+    acc_d = tl.zeros((BT, 64), tl.float32)
+    acc_m = tl.zeros((BT, 64), tl.float32)
+    sq_d = tl.zeros((BT,), tl.float32)
+    sq_m = tl.zeros((BT,), tl.float32)
+    wd_base = WdownT + s * (2 * D * 64)
+    for k0 in range(0, D, BK):
+        k = k0 + tl.arange(0, BK)
+        d_val = tl.load(Dest + s * sd_s + t[:, None] * sd_t + k[None, :], t_mask[:, None], other=0.0)
+        b0 = tl.load(Bank0 + t[:, None] * sb0 + k[None, :], t_mask[:, None], other=0.0).to(tl.float32)
+        b1 = tl.load(Bank1 + t[:, None] * sb1 + k[None, :], t_mask[:, None], other=0.0).to(tl.float32)
+        m_val = c0[:, None] * b0 + c1[:, None] * b1
+        sq_d += tl.sum(d_val * d_val, axis=1)
+        sq_m += tl.sum(m_val * m_val, axis=1)
+        wd = tl.load(wd_base + k[:, None] * 64 + r[None, :])
+        wm = tl.load(wd_base + (D + k[:, None]) * 64 + r[None, :])
+        acc_d += tl.dot(d_val.to(tl.bfloat16), wd)
+        acc_m += tl.dot(m_val.to(tl.bfloat16), wm)
+    rstd_d = tl_hip_lib.rsqrt(tl.div_rn(sq_d, D) + 1e-6)
+    rstd_m = tl_hip_lib.rsqrt(tl.div_rn(sq_m, D) + 1e-6)
+    hidden = (acc_d * rstd_d[:, None] + acc_m * rstd_m[:, None]).to(tl.bfloat16)
+
+    wu_base = Wup + s * (2 * D * 64)
+    sq_b = tl.zeros((BT,), tl.float32)
+    out_base = Out + (s * T + t[:, None]) * D
+    for k0 in range(0, D, BK):
+        k = k0 + tl.arange(0, BK)
+        wg = tl.load(wu_base + k[:, None] * 64 + r[None, :])
+        wf = tl.load(wu_base + (D + k[:, None]) * 64 + r[None, :])
+        gain = _turbo_fast_tanh(tl.dot(hidden, tl.trans(wg)))
+        forget = _turbo_fast_tanh(tl.dot(hidden, tl.trans(wf)))
+        d_val = tl.load(Dest + s * sd_s + t[:, None] * sd_t + k[None, :], t_mask[:, None], other=0.0)
+        b0 = tl.load(Bank0 + t[:, None] * sb0 + k[None, :], t_mask[:, None], other=0.0).to(tl.float32)
+        b1 = tl.load(Bank1 + t[:, None] * sb1 + k[None, :], t_mask[:, None], other=0.0).to(tl.float32)
+        m_val = c0[:, None] * b0 + c1[:, None] * b1
+        b = (1.0 - forget) * d_val + gain * m_val
+        sq_b += tl.sum(b * b, axis=1)
+        tl.store(out_base + k[None, :], b.to(tl.bfloat16), t_mask[:, None])
+    rstd_b = tl_hip_lib.rsqrt(tl.div_rn(sq_b, D) + norm_eps)
+    nw_base = NormW + s * sw_s
+    for k0 in range(0, D, BK):
+        k = k0 + tl.arange(0, BK)
+        b = tl.load(out_base + k[None, :], t_mask[:, None], other=0.0).to(tl.float32)
+        nw = tl.load(nw_base + k).to(tl.float32)
+        tl.store(out_base + k[None, :], (b * rstd_b[:, None] * nw[None, :]).to(tl.bfloat16), t_mask[:, None])
+
+
+def fused_loop_zeromat_prefill(
+    dest: torch.Tensor,
+    bank0: torch.Tensor,
+    bank1: torch.Tensor,
+    coeffs: torch.Tensor,
+    down_weight_t: torch.Tensor,
+    up_weight: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+) -> torch.Tensor | None:
+    if (
+        not dest.is_cuda
+        or dest.ndim != 3
+        or dest.dtype != torch.float32
+        or dest.stride(-1) != 1
+        or bank0.dtype != torch.bfloat16
+        or bank1.dtype != torch.bfloat16
+        or coeffs.dtype != torch.float32
+        or not coeffs.is_contiguous()
+    ):
+        return None
+    streams, t_len, width = dest.shape
+    if (
+        t_len < 64
+        or width != 2304
+        or streams not in (1, 3)
+        or bank0.shape != (t_len, width)
+        or bank1.shape != (t_len, width)
+        or bank0.stride(-1) != 1
+        or bank1.stride(-1) != 1
+        or coeffs.shape != (streams, t_len, 2)
+        or down_weight_t.shape != (streams, 2 * width, 64)
+        or up_weight.shape != (streams, 2 * width, 64)
+        or down_weight_t.dtype != torch.bfloat16
+        or up_weight.dtype != torch.bfloat16
+        or not down_weight_t.is_contiguous()
+        or not up_weight.is_contiguous()
+        or norm_weight.shape != (streams, width)
+        or norm_weight.stride(-1) != 1
+    ):
+        return None
+    out = bank0.new_empty((streams, t_len, width), dtype=torch.bfloat16)
+    bt = 16
+    _fused_loop_zeromat_kernel[(streams, triton.cdiv(t_len, bt))](
+        dest, bank0, bank1, coeffs, down_weight_t, up_weight, norm_weight, out,
+        *dest.stride()[:2], bank0.stride(0), bank1.stride(0), coeffs.stride(0), norm_weight.stride(0),
+        t_len, norm_eps, D=width, BT=bt, BK=64, num_warps=4,
     )
     return out

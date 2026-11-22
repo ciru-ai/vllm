@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Modified or added by Ciru for Inkling 2 Mini on AMD gfx1151.
 """Inkling2 DSpark draft (`mtp.safetensors`): an anchor plus mask block run
 through a small dense transformer over DFlare-mixed target-feature K/V, then a
 recurrent (`rnn_hidden`) Markov head. Numerics follow the reference
@@ -331,9 +330,7 @@ class Inkling2DraftMLP(nn.Module):
             from .ops.turbo_kernels import w4_wmma_linear
 
             x = silu_and_mul(w4_wmma_linear(x, self.w4_gate_up, splits=1))
-            if x.shape[0] <= 16:
-                return w4_wmma_linear(x, self.w4_down, splits=4)
-            return _draft_linear(x, self.down_proj, self.w8_down)
+            return w4_wmma_linear(x, self.w4_down, splits=4)
         x = silu_and_mul(_draft_linear(x, self.gate_up_proj, self.w8_gate_up))
         return _draft_linear(x, self.down_proj, self.w8_down)
 

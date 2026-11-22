@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Modified or added by Ciru for Inkling 2 Mini on AMD gfx1151.
 """Inkling2 attention: relative-bias GQA with short-conv K/V, L2-clipped
 q/k/r, gated output and per-token attention sinks."""
 
@@ -615,11 +614,13 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         if (
             self._w6_verify_batch
             and self._w6_wmma_wo is not None
-            and _can_project_w6_batch(output, 16)
+            and _can_project_w6_batch(output, 64)
         ):
             from .ops.turbo_kernels import w6_wmma_linear
 
-            return w6_wmma_linear(output, self._w6_wmma_wo, splits=4)
+            return w6_wmma_linear(
+                output, self._w6_wmma_wo, splits=4 if output.shape[0] <= 16 else 2,
+            )
         if (
             self._w6_verify_batch
             and self._groupwise_w6_wo is not None
@@ -681,39 +682,76 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         key_cache, value_cache = self._split_kv_cache(kv_cache)
         clipped_q = q.new_empty(q.shape)
         # Sheared as `rel_attention` reads it (see attention_prologue).
-        rel_logits = q.new_empty(
-            (num_tokens + 128, self.num_heads, self.rel_extent + 256)
-        )
-        attention_prologue(
-            q,
-            r.view(num_tokens, self.num_heads, self.d_rel),
-            k,
-            v,
-            self.q_scale,
-            self.r_scale,
-            tau,
-            self.rel_proj_shifted,
-            self.k_sconv.conv_weight,
-            self.v_sconv.conv_weight,
-            k_dynamic,
-            v_dynamic,
-            conv_state.kv_cache,
-            positions,
-            conv_md.block_table,
-            conv_md.seq_idx,
-            conv_md.slot_mapping,
-            conv_md.query_start,
-            key_cache,
-            value_cache,
-            md.slot_mapping,
-            clipped_q,
-            rel_logits,
-            md.query_start_loc,
-            md.seq_lens,
-            clip_threshold=self.qk_clip,
-            rel_threshold=self.rel_clip,
-            norm_eps=self.eps,
-        )
+        if self._turbo_prefill_attn and num_tokens >= 16:
+            from .ops.turbo_kernels import turbo_attention_prologue
+
+            rel_logits = q.new_empty(
+                (self.num_heads, num_tokens + 128, self.rel_extent + 256)
+            ).transpose(0, 1)
+            turbo_attention_prologue(
+                q,
+                r.view(num_tokens, self.num_heads, self.d_rel),
+                k,
+                v,
+                self.q_scale,
+                self.r_scale,
+                tau,
+                self.rel_proj_shifted,
+                self.k_sconv.conv_weight,
+                self.v_sconv.conv_weight,
+                k_dynamic,
+                v_dynamic,
+                conv_state.kv_cache,
+                positions,
+                conv_md.block_table,
+                conv_md.seq_idx,
+                conv_md.slot_mapping,
+                conv_md.query_start,
+                key_cache,
+                value_cache,
+                md.slot_mapping,
+                clipped_q,
+                rel_logits,
+                md.query_start_loc,
+                md.seq_lens,
+                clip_threshold=self.qk_clip,
+                rel_threshold=self.rel_clip,
+                norm_eps=self.eps,
+            )
+        else:
+            rel_logits = q.new_empty(
+                (num_tokens + 128, self.num_heads, self.rel_extent + 256)
+            )
+            attention_prologue(
+                q,
+                r.view(num_tokens, self.num_heads, self.d_rel),
+                k,
+                v,
+                self.q_scale,
+                self.r_scale,
+                tau,
+                self.rel_proj_shifted,
+                self.k_sconv.conv_weight,
+                self.v_sconv.conv_weight,
+                k_dynamic,
+                v_dynamic,
+                conv_state.kv_cache,
+                positions,
+                conv_md.block_table,
+                conv_md.seq_idx,
+                conv_md.slot_mapping,
+                conv_md.query_start,
+                key_cache,
+                value_cache,
+                md.slot_mapping,
+                clipped_q,
+                rel_logits,
+                md.query_start_loc,
+                md.seq_lens,
+                clip_threshold=self.qk_clip,
+                rel_threshold=self.rel_clip,
+                norm_eps=self.eps,
+            )
         # Decode and verify batches split the keys; the split count follows
         # the batch alone, so it holds for every replay of a CUDA graph.
         m1 = md.seq_lens.shape[0] == md.max_query_len == 1

@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Modified or added by Ciru for Inkling 2 Mini on AMD gfx1151.
 """Eager TP1 text backend for Inkling 2 Mini on ROCm."""
 
 import os
@@ -259,9 +258,35 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
             down, gain_forget = self.controller_down, self.controller_gain_forget
             assert controller.down_weight.data_ptr() == down[i].data_ptr()
             assert controller.gain_weight.data_ptr() == gain_forget[i].data_ptr()
+        self.controller_down_t = None
         if self.use_packed_loop and self.controller_gain_forget.is_cuda:
             # This is the same FP32 widening that the eager path does per visit.
             self.controller_gain_forget_fp32 = self.controller_gain_forget.float()
+            self.controller_down_t = self.controller_down.transpose(1, 2).contiguous()
+
+    def blend_zeromat(
+        self,
+        streams: slice,
+        dest: torch.Tensor,
+        bank0: torch.Tensor,
+        bank1: torch.Tensor,
+        coeffs: torch.Tensor,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
+    ) -> torch.Tensor | None:
+        down_t = getattr(self, "controller_down_t", None)
+        if down_t is None and self.controller_down.is_cuda:
+            down_t = self.controller_down.transpose(1, 2).contiguous()
+            self.controller_down_t = down_t
+        if down_t is None:
+            return None
+        from .ops.turbo_kernels import fused_loop_zeromat_prefill
+
+        return fused_loop_zeromat_prefill(
+            dest, bank0, bank1, coeffs,
+            down_t[streams], self.controller_gain_forget[streams],
+            norm_weight, norm_eps,
+        )
 
     def blend(
         self,
@@ -274,6 +299,25 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
         """The `streams` controllers on fp32 `(S, T, D)` `dest` (may
         broadcast over streams) and `message`, each output RMS-normalized
         with its row of `norm_weight` `(S, D)`: bf16 `(S, T, D)`."""
+        if (
+            self.use_packed_loop
+            and message.shape[1] >= 64
+            and os.getenv("INKLING_AMD_TURBO_PREFILL_ATTN") == "1"
+            and os.getenv("INKLING_AMD_FUSED_LOOP_ALLINONE", "1") != "0"
+        ):
+            down_t = getattr(self, "controller_down_t", None)
+            if down_t is None and self.controller_down.is_cuda:
+                down_t = self.controller_down.transpose(1, 2).contiguous()
+                self.controller_down_t = down_t
+            if down_t is not None:
+                from .ops.turbo_kernels import fused_loop_allinone_prefill
+
+                result = fused_loop_allinone_prefill(
+                    dest, message, down_t[streams],
+                    self.controller_gain_forget[streams], norm_weight, norm_eps,
+                )
+                if result is not None:
+                    return result
         pair = pair_rms_norm(dest, message, packed=self.use_packed_loop)
         down_weight = self.controller_down[streams]
         gain_forget = None
@@ -307,7 +351,7 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
                     return result
             if (
                 self.use_packed_loop
-                and pair.shape[1] >= 64
+                and pair.shape[1] >= 16
                 and os.getenv("INKLING_AMD_TURBO_PREFILL_ATTN") == "1"
             ):
                 from .ops.turbo_kernels import fused_loop_prefill_blend
@@ -444,23 +488,51 @@ class Inkling2LoopModel(nn.Module):
         partial = stack[num_blocks]
         owner = layer.conv_states[pass_idx]
         messages = None
+        msg_coeffs = None
         if bank is not None:
             assert isinstance(layer, Inkling2LoopDecoderLayer) and inputs is not None
-            messages = attn_res(
-                bank[:1],
-                bank[1],
-                None,
-                self.message_queries[layer_id - self.loop_core.start],
-                None,
-                0.0,
-                True,
-            )
             norm = layer.attn_norm
             destinations = inputs.expand(3, -1, -1) if layer.is_local else inputs
             norm_weight = norm.weight.expand(3, -1) if layer.is_local else norm.weight
-            attn_inputs = layer.blend(
-                slice(0, 3), destinations, messages[:3], norm_weight, norm.eps
-            )
+            attn_inputs = None
+            if (
+                layer.use_packed_loop
+                and partial.shape[0] >= 64
+                and os.getenv("INKLING_AMD_TURBO_PREFILL_ATTN") == "1"
+                and os.getenv("INKLING_AMD_FUSED_LOOP_ALLINONE", "1") != "0"
+            ):
+                from .ops.hip_moe_prefill import hip_attn_res_q4_coeffs
+
+                msg_coeffs = hip_attn_res_q4_coeffs(
+                    bank[0],
+                    bank[1],
+                    self.message_queries[layer_id - self.loop_core.start],
+                )
+                if msg_coeffs is not None:
+                    attn_inputs = layer.blend_zeromat(
+                        slice(0, 3),
+                        destinations,
+                        bank[0],
+                        bank[1],
+                        msg_coeffs[:3],
+                        norm_weight,
+                        norm.eps,
+                    )
+                    if attn_inputs is None:
+                        msg_coeffs = None
+            if attn_inputs is None:
+                messages = attn_res(
+                    bank[:1],
+                    bank[1],
+                    None,
+                    self.message_queries[layer_id - self.loop_core.start],
+                    None,
+                    0.0,
+                    True,
+                )
+                attn_inputs = layer.blend(
+                    slice(0, 3), destinations, messages[:3], norm_weight, norm.eps
+                )
         elif inputs is None:
             assert num_blocks == 0
             attn_inputs = [
@@ -475,7 +547,8 @@ class Inkling2LoopModel(nn.Module):
             owner=owner,
         )
         first = layer_id % self.block_size == 0
-        mlp_norm = layer.mlp_norm if messages is None else None
+        has_loop_msg = (messages is not None) or (msg_coeffs is not None)
+        mlp_norm = layer.mlp_norm if not has_loop_msg else None
         query = self.attn_res.mlp_queries[layer_id]
         if first:
             mlp_inputs = self._mix(stack[:num_blocks + 1], attn_out, query, mlp_norm)
@@ -483,7 +556,27 @@ class Inkling2LoopModel(nn.Module):
             mlp_inputs = self._mix(
                 stack[:num_blocks], partial, query, mlp_norm, attn_out
             )
-        if messages is not None:
+        if msg_coeffs is not None:
+            norm = layer.mlp_norm
+            zm_mlp = layer.blend_zeromat(
+                slice(3, 4), mlp_inputs, bank[0], bank[1], msg_coeffs[3:], norm.weight, norm.eps
+            )
+            if zm_mlp is not None:
+                mlp_inputs = zm_mlp
+            else:
+                messages = attn_res(
+                    bank[:1],
+                    bank[1],
+                    None,
+                    self.message_queries[layer_id - self.loop_core.start],
+                    None,
+                    0.0,
+                    True,
+                )
+                mlp_inputs = layer.blend(
+                    slice(3, 4), mlp_inputs, messages[3:], norm.weight, norm.eps
+                )
+        elif messages is not None:
             norm = layer.mlp_norm
             mlp_inputs = layer.blend(
                 slice(3, 4), mlp_inputs, messages[3:], norm.weight, norm.eps

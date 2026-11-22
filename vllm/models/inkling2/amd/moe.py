@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Modified or added by Ciru for Inkling 2 Mini on AMD gfx1151.
 """Inkling 2 Mini TP1 ROCm experts, preserving the publisher's packed weights."""
 
 from pathlib import Path
@@ -88,6 +87,13 @@ class Inkling2Gate(nn.Module):
             from .ops.router import router_scores_m1
 
             scores = router_scores_m1(x, self.weight, self.bias)
+        elif (
+            x.shape[0] >= 64
+            and os.getenv("INKLING_AMD_TURBO_PREFILL_MOE", "0") not in ("", "0")
+        ):
+            from .ops.turbo_kernels import router_scores_prefill
+
+            scores = router_scores_prefill(x, self.weight, self.bias)
         if scores is None:
             score = self.fp32_logits(x).sigmoid()
             corrected = score + self.bias
@@ -358,13 +364,35 @@ class Inkling2Experts(nn.Module):
             and (self.source_wmma_banks or self.verifier_wmma_banks)
             and (plan.block_m, plan.block_n, plan.block_k) == (64, 128, 64)
         ):
+            bank = self.verifier_wmma_banks.get(name)
+            if turbo_prefill_mode != "bf16":
+                from .ops.hip_moe_prefill import hip_moe_prefill_projection
+
+                if bank is not None:
+                    bkind = "coda" if self.coda_c1_path is not None else "mixed"
+                    hip_out = hip_moe_prefill_projection(
+                        x, bank, plan, bank_kind=bkind,
+                        fused_activation=fused_activation,
+                        out_fp16=(name == "w13"),
+                    )
+                    if hip_out is not None:
+                        return hip_out
+                elif self.source_wmma_banks:
+                    hip_out = hip_moe_prefill_projection(
+                        x, self.source_wmma_banks[name], plan, bank_kind="source",
+                        fused_activation=fused_activation,
+                        out_fp16=(name == "w13"),
+                    )
+                    if hip_out is not None:
+                        return hip_out
+            if x.dtype != torch.bfloat16:
+                x = x.to(torch.bfloat16)
             from .ops.turbo_kernels import (
                 coda_wmma_prefill_m64,
                 mixed_wmma_prefill_m64,
                 source_wmma_turbo_projection,
             )
 
-            bank = self.verifier_wmma_banks.get(name)
             if bank is not None:
                 if self.coda_c1_path is not None:
                     if turbo_prefill_mode != "bf16":
