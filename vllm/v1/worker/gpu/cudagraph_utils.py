@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import itertools
+import os
 from collections import defaultdict
 from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from contextlib import ExitStack
@@ -35,7 +36,7 @@ from vllm.distributed.parallel_state import (
     graph_capture,
     is_global_first_rank,
 )
-from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import requires_raw_input_tokens
 from vllm.model_executor.offloader.base import get_offloader
@@ -823,6 +824,14 @@ class ModelCudaGraphManager(CudaGraphManager):
             if pcp_manager is not None:
                 is_padding = pcp_manager.moe_is_padding(is_padding)
 
+            use_inkling_source_wmma = (
+                desc.cg_mode == CUDAGraphMode.FULL
+                and num_reqs == 1
+                and num_tokens == desc.uniform_token_count and 2 <= num_tokens <= 8
+                and os.getenv("INKLING_AMD_DSPARK_TARGET_GRAPH") == "1"
+                and os.getenv("INKLING_AMD_SOURCE_WMMA_PRETILE") == "1"
+            )
+
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
                 batch_descriptor = None
                 if cg_mode == CUDAGraphMode.PIECEWISE:
@@ -840,6 +849,8 @@ class ModelCudaGraphManager(CudaGraphManager):
                     batch_descriptor=batch_descriptor,
                     is_padding=is_padding,
                 ):
+                    if use_inkling_source_wmma:
+                        get_forward_context().additional_kwargs["inkling_source_wmma_pretile"] = True
                     if cg_mode == CUDAGraphMode.PIECEWISE:
                         # PIECEWISE graph (compiled PW or breakable, chosen inside
                         # run_pw_graph).

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -325,6 +326,14 @@ class Scheduler(SchedulerInterface):
             )
         speculative_config = vllm_config.speculative_config
         self.num_spec_tokens = vllm_config.num_scheduled_spec_tokens
+        self.inkling_dspark_phase_switch = os.getenv("INKLING_AMD_DSPARK_PHASE_SWITCH") == "1"
+        if self.inkling_dspark_phase_switch and (
+            speculative_config is None
+            or speculative_config.method != "dspark"
+            or self.num_spec_tokens != 7
+            or self.scheduler_config.max_num_seqs != 1
+        ):
+            raise ValueError("Inkling phase switching requires one sequence and seven DSpark drafts")
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
         # DSV41 SWA bounded replay: groups that declare a replay window are rebuilt
         # after a prefix hit by recomputing its trailing tokens. One window
@@ -698,6 +707,20 @@ class Scheduler(SchedulerInterface):
         if 0 < remaining < self.num_prefill_lookahead:
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
+
+    def _inkling_draft_policy(self, request: Request) -> str:
+        params = request.sampling_params
+        if params is None or params.temperature != 0 or request.use_structured_output:
+            return "always"
+        policy = (params.extra_args or {}).get("inkling_draft_policy")
+        return policy if policy in ("plain", "answer_only") else "always"
+
+    def _inkling_drafting_disabled(self, request: Request, policy: str) -> bool:
+        # Only emitted tokens can open an answer. The prompt may also contain
+        # content delimiters, and in-flight placeholders have no token identity.
+        return policy == "plain" or (
+            policy == "answer_only" and 200004 not in request.output_token_ids
+        )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -1352,6 +1375,12 @@ class Scheduler(SchedulerInterface):
                     # Not for diffusion where draft tokens can't be padded.
                     if (
                         (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                        and (
+                            not self.inkling_dspark_phase_switch
+                            or not self._inkling_drafting_disabled(
+                                request, self._inkling_draft_policy(request)
+                            )
+                        )
                         and self.num_sampled_tokens_per_step > 0
                         and num_new_tokens == 1
                         and not prefill_scheduled
@@ -1754,6 +1783,21 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
+
+        if self.inkling_dspark_phase_switch and len(num_scheduled_tokens) == 1:
+            request_id = next(iter(num_scheduled_tokens))
+            request = self.requests[request_id]
+            policy = self._inkling_draft_policy(request)
+            if self._inkling_drafting_disabled(request, policy):
+                num_spec_tokens_to_schedule = 0
+                drafts_needed = False
+            elif (policy == "answer_only" and drafts_needed
+                  and request_id not in scheduled_spec_decode_tokens
+                  and num_scheduled_tokens[request_id] == 1):
+                logger.info(
+                    "Inkling answer-only transition for %s at %d committed tokens",
+                    request_id, request.num_output_tokens,
+                )
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
