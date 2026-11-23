@@ -42,6 +42,11 @@ def rms_norm(
     n = x.shape[-1]
     assert x.stride(-1) == 1
     x2d = x if x.dim() == 2 else x.reshape(-1, n)
+    from .hip_runtime import hip_rms_norm
+
+    hip_out = hip_rms_norm(x, weight, eps, out_dtype)
+    if hip_out is not None:
+        return hip_out
     out = torch.empty(x.shape, dtype=out_dtype or x.dtype, device=x.device)
     if x2d.shape[0]:
         block = triton.next_power_of_2(n)

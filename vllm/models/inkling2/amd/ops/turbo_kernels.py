@@ -787,6 +787,11 @@ def _router_gemm_m8_fp32_kernel(X, W, Out, M: tl.constexpr, K: tl.constexpr, BLO
 
 
 def router_gemm_m8_fp32(x: torch.Tensor, w_bf16: torch.Tensor) -> torch.Tensor:
+    from .hip_runtime import hip_router_gemm_m8
+
+    hip_out = hip_router_gemm_m8(x, w_bf16)
+    if hip_out is not None:
+        return hip_out
     m = x.shape[0]
     out = torch.empty((m, 128), dtype=torch.float32, device=x.device)
     _router_gemm_m8_fp32_kernel[(128,)](
@@ -1131,6 +1136,10 @@ def w6_wmma_linear(
     x: torch.Tensor, weight: W6WmmaWeight, *,
     out_dtype: torch.dtype = torch.bfloat16, soft_cap: float = 0.0, splits: int = 1,
 ) -> torch.Tensor:
+    from .hip_runtime import hip_w6_wmma_linear
+    hip_out = hip_w6_wmma_linear(x, weight, splits=splits, out_dtype=out_dtype, soft_cap=soft_cap)
+    if hip_out is not None:
+        return hip_out
     m, k = x.shape
     n_pad = weight.padded_out
     out = x.new_empty((m, n_pad), dtype=out_dtype)
@@ -1179,6 +1188,10 @@ def w6_wmma_qkv_linear(
     x_q: torch.Tensor, x_k: torch.Tensor, x_v: torch.Tensor,
     weight: W6WmmaWeight, q_pad: int, k_end: int,
 ) -> torch.Tensor:
+    from .hip_runtime import hip_w6_wmma_qkv_linear
+    hip_out = hip_w6_wmma_qkv_linear(x_q, x_k, x_v, weight, q_pad, k_end)
+    if hip_out is not None:
+        return hip_out
     m, k = x_q.shape
     n_pad = weight.padded_out
     out = x_q.new_empty((m, n_pad), dtype=torch.bfloat16)
@@ -1393,6 +1406,10 @@ def _w4_wmma_splitk_kernel(
 def w4_wmma_linear(
     x: torch.Tensor, weight: W4WmmaWeight, *, bias: torch.Tensor | None = None, splits: int = 1,
 ) -> torch.Tensor:
+    from .hip_runtime import hip_w4_wmma_linear
+    hip_out = hip_w4_wmma_linear(x, weight, bias=bias, splits=splits)
+    if hip_out is not None:
+        return hip_out
     m, k = x.shape
     n_pad = weight.padded_out
     out = x.new_empty((m, n_pad), dtype=torch.bfloat16)
@@ -1481,6 +1498,10 @@ def w4_markov_argmax(
     latent: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor,
     bias: torch.Tensor, base: torch.Tensor, softcap: float, valid: int,
 ) -> torch.Tensor:
+    from .hip_runtime import hip_w4_markov_argmax
+    hip_out = hip_w4_markov_argmax(latent, packed, scales, bias, base, softcap, valid)
+    if hip_out is not None:
+        return hip_out
     rows = 16
     splits = triton.cdiv(valid, rows)
     values = torch.empty(splits, dtype=torch.float32, device=base.device)
@@ -1796,6 +1817,11 @@ def _fast_route_m8_kernel(
 
 
 def fast_route_m8(logits: torch.Tensor, bias: torch.Tensor, scale: float):
+    from .hip_runtime import hip_route_m8
+
+    hip_res = hip_route_m8(logits, bias, scale, "align")
+    if hip_res is not None:
+        return hip_res
     m = logits.shape[0]
     ids = torch.empty((m, 8), dtype=torch.int64, device=logits.device)
     gamma = torch.empty((m, 8), dtype=torch.float32, device=logits.device)
@@ -1829,6 +1855,11 @@ def _controller_down_m8_kernel(Pair, W, Out, M: tl.constexpr, K: tl.constexpr, B
 
 
 def controller_down_m8(pair: torch.Tensor, down_weight: torch.Tensor) -> torch.Tensor:
+    from .hip_runtime import hip_loop_decode_down
+
+    hip_out = hip_loop_decode_down(pair, down_weight)
+    if hip_out is not None:
+        return hip_out
     streams, m, k = pair.shape
     out = pair.new_empty((streams, m, 64))
     _controller_down_m8_kernel[(64, streams)](
@@ -2159,6 +2190,12 @@ def fused_loop_prefill_blend(
     if not _packed_rows(dest, message):
         return None
     streams, t_len, width = message.shape
+    if 1 <= t_len <= 64:
+        from .hip_runtime import hip_loop_decode_blend_rms
+
+        hip_out = hip_loop_decode_blend_rms(hidden, weight, dest, message, norm_weight, norm_eps)
+        if hip_out is not None:
+            return hip_out
     if (
         t_len < 16
         or width != 2304
@@ -2392,6 +2429,12 @@ def _router_prefill_bf16_to_fp32_kernel(
 def router_scores_prefill(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if x.ndim == 2 and x.shape[0] >= 64:
+        from .hip_runtime import hip_router_prefill
+
+        hip_res = hip_router_prefill(x, weight, bias)
+        if hip_res is not None:
+            return hip_res
     if (
         not x.is_cuda
         or x.ndim != 2
@@ -2588,6 +2631,14 @@ def fused_loop_zeromat_prefill(
     norm_weight: torch.Tensor,
     norm_eps: float,
 ) -> torch.Tensor | None:
+    if dest.ndim == 3 and dest.shape[1] >= 64:
+        from .hip_runtime import hip_loop_zeromat_prefill
+
+        hip_out = hip_loop_zeromat_prefill(
+            dest, bank0, bank1, coeffs, down_weight_t, up_weight, norm_weight, norm_eps,
+        )
+        if hip_out is not None:
+            return hip_out
     if (
         not dest.is_cuda
         or dest.ndim != 3

@@ -253,6 +253,14 @@ def fused_attn_res(
            for x in (stack, last, tail, queries, weight)):
         return None
 
+    if tokens >= 1:
+        from .hip_runtime import hip_attn_res_prefill
+
+        hip_out = hip_attn_res_prefill(
+            stack, last, addend, queries, norm_weight, norm_eps, normalize_values, eps=eps,
+        )
+        if hip_out is not None:
+            return hip_out
     dtype = last.dtype if norm_weight is not None else torch.float32
     out = last.new_empty((queries.shape[0], tokens, width), dtype=dtype)
     if tokens:

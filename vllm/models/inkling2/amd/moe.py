@@ -366,22 +366,23 @@ class Inkling2Experts(nn.Module):
         ):
             bank = self.verifier_wmma_banks.get(name)
             if turbo_prefill_mode != "bf16":
-                from .ops.hip_moe_prefill import hip_moe_prefill_projection
+                from .ops.hip_runtime import can_run_hip_moe_pair, hip_moe_prefill_projection
 
+                allow_fp16 = (name == "w13") and (fused_activation is not None) and can_run_hip_moe_pair(self, x, plan)
                 if bank is not None:
                     bkind = "coda" if self.coda_c1_path is not None else "mixed"
                     hip_out = hip_moe_prefill_projection(
                         x, bank, plan, bank_kind=bkind,
                         fused_activation=fused_activation,
-                        out_fp16=(name == "w13"),
+                        out_fp16=allow_fp16,
                     )
                     if hip_out is not None:
                         return hip_out
-                elif self.source_wmma_banks:
+                elif self.source_wmma_banks and name in self.source_wmma_banks:
                     hip_out = hip_moe_prefill_projection(
                         x, self.source_wmma_banks[name], plan, bank_kind="source",
                         fused_activation=fused_activation,
-                        out_fp16=(name == "w13"),
+                        out_fp16=allow_fp16,
                     )
                     if hip_out is not None:
                         return hip_out
@@ -417,6 +418,37 @@ class Inkling2Experts(nn.Module):
             )
         ):
             bank = self.verifier_wmma_banks.get(name)
+            use_hip_decode = (
+                os.getenv("INKLING_AMD_TURBO_MOE_F16") == "1"
+                or (turbo_prefill_on and turbo_prefill_mode != "bf16")
+            )
+            if use_hip_decode:
+                from .ops.hip_runtime import can_run_hip_moe_decode_pair, hip_moe_decode_projection
+
+                allow_fp16 = (
+                    (name == "w13")
+                    and (fused_activation is not None)
+                    and can_run_hip_moe_decode_pair(self, x, plan)
+                )
+                if bank is not None:
+                    bkind = "coda" if self.coda_c1_path is not None else "mixed"
+                    hip_out = hip_moe_decode_projection(
+                        x, bank, plan, bank_kind=bkind,
+                        fused_activation=fused_activation,
+                        out_fp16=allow_fp16,
+                    )
+                    if hip_out is not None:
+                        return hip_out
+                elif self.source_wmma_banks and name in self.source_wmma_banks:
+                    hip_out = hip_moe_decode_projection(
+                        x, self.source_wmma_banks[name], plan, bank_kind="source",
+                        fused_activation=fused_activation,
+                        out_fp16=allow_fp16,
+                    )
+                    if hip_out is not None:
+                        return hip_out
+            if x.dtype != torch.bfloat16:
+                x = x.to(torch.bfloat16)
             if bank is not None:
                 if self.coda_c1_path is not None:
                     if os.getenv("INKLING_AMD_TURBO_MOE_F16") == "1":
@@ -563,6 +595,11 @@ class Inkling2MoE(nn.Module):
                 mid = self.activate(gate, up, gamma)
             down = self.experts.project_prefill("w2", mid, plan)
             if self.prefill_fused_reduce:
+                from .ops.hip_runtime import hip_moe_reduce
+
+                reduced = hip_moe_reduce(down)
+                if reduced is not None:
+                    return reduced
                 from .ops.grouped_decode import inkling_reduce
 
                 return inkling_reduce(down)

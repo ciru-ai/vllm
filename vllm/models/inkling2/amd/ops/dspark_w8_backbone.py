@@ -126,6 +126,11 @@ def draft_w8_linear(
         splits = 4 if k == 9216 else 1
     if splits not in (1, 2, 4, 8) or k % (_GROUP_SIZE * splits):
         raise ValueError("Split K must divide all G128 groups")
+    from .hip_runtime import hip_dspark_w8_linear
+
+    hip_out = hip_dspark_w8_linear(x, weight, splits=splits)
+    if hip_out is not None:
+        return hip_out
     out = torch.empty((8, n), device=x.device, dtype=torch.bfloat16)
     partial = out if splits == 1 else torch.empty(
         (splits, 8, n), device=x.device, dtype=torch.float32,

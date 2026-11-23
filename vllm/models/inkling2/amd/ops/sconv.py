@@ -415,6 +415,27 @@ def short_conv(
     num_heads = cache.shape[1]
     assert channels == num_heads * stream_width
     width = weight.shape[1]
+    if width == 4:
+        if num_tokens >= 64:
+            from .hip_runtime import hip_sconv_prefill
+
+            hip_out = hip_sconv_prefill(
+                x, weight, cache, positions, block_table, seq_idx, slot_mapping,
+                query_start, stream_offset, stream_width,
+                addend=addend, residual=residual, out=out,
+            )
+            if hip_out is not None:
+                return hip_out
+        elif num_tokens > 0:
+            from .hip_runtime import hip_sconv_decode
+
+            hip_out = hip_sconv_decode(
+                x, weight, cache, positions, block_table, seq_idx, slot_mapping,
+                query_start, stream_offset, stream_width,
+                addend=addend, residual=residual, out=out,
+            )
+            if hip_out is not None:
+                return hip_out
     # Prefill tiles skip the cache reads they never need.
     prefill = num_tokens > 256
     if num_tokens <= 8:

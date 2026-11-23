@@ -363,6 +363,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
 
     def process_weights_after_loading(self) -> None:
         self.rel_proj_shifted = shift_rel_proj(self.rel_logits_proj, self.is_local)
+        self.rel_proj_t = self.rel_logits_proj.transpose(0, 1).contiguous()
         if os.getenv("INKLING_AMD_QKVR_W8") == "1" and self.qkvr.weight is not None:
             self._qkvr_w8, self._qkvr_scale = pack_qkvr_w8(self.qkvr.weight)
             self.qkvr.weight = None
@@ -680,7 +681,160 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         num_tokens = q.shape[0]
         q = q.view(num_tokens, self.num_heads, self.head_dim)
         key_cache, value_cache = self._split_kv_cache(kv_cache)
+        # Decode and verify batches split the keys; evaluate upfront so the
+        # prologue and attention consumer always agree on zero-mat HIP dispatch.
+        m1 = md.seq_lens.shape[0] == md.max_query_len == 1
+        key_tile = self.m1_key_tile if m1 else None
+        num_splits = plan_decode_attention(
+            self.is_local,
+            md.seq_lens.shape[0],
+            md.max_query_len,
+            self.num_heads,
+            self.num_kv_heads,
+            self.rel_extent,
+            programs_per_cu=self.m1_split_programs_per_cu if m1 else None,
+            key_tile=key_tile,
+        )
+        r_view = r.view(num_tokens, self.num_heads, self.d_rel)
         clipped_q = q.new_empty(q.shape)
+
+        # Zero-materialization native HIP prefill attention (B0/B1/B2).
+        rel_proj_t = getattr(self, "rel_proj_t", None)
+        if self._turbo_prefill_attn and rel_proj_t is not None and num_splits == 0 and num_tokens >= 64:
+            from .ops.hip_runtime import (
+                can_run_hip_kv_conv_1w,
+                can_run_hip_prefill_attn,
+                hip_flash_rel_attn_prefill,
+                hip_kv_conv_1w,
+                hip_qr_clip,
+            )
+
+            dynamic = k_dynamic is not None
+            k_weight = self.k_sconv.conv_weight
+            v_weight = self.v_sconv.conv_weight
+            width = k_weight.shape[0] if dynamic else k_weight.shape[1]
+            kv_writer_ok = can_run_hip_kv_conv_1w(
+                k, v, k_weight, v_weight, k_dynamic, v_dynamic,
+                conv_state.kv_cache, key_cache, value_cache, md.slot_mapping,
+                num_tokens=num_tokens, head_dim=self.head_dim, width=width,
+            )
+            if (
+                not torch.cuda.is_current_stream_capturing()
+                and can_run_hip_prefill_attn(
+                    q, r_view, key_cache, value_cache,
+                    max_query_len=md.max_query_len,
+                    num_splits=num_splits,
+                    kv_writer_ok=kv_writer_ok,
+                    rel_proj_t=rel_proj_t,
+                    q_scale=self.q_scale,
+                    r_scale=self.r_scale,
+                    gate=gate,
+                    sinks=sinks,
+                    output=output,
+                    q_out=clipped_q,
+                )
+            ):
+                qr_res = hip_qr_clip(
+                    q, r_view, self.q_scale, self.r_scale, tau,
+                    q_threshold=self.qk_clip, r_threshold=self.rel_clip,
+                    eps=1e-6, q_out=clipped_q,
+                )
+                if qr_res is not None:
+                    _, r_clipped = qr_res
+                    scale = (width * (2 if dynamic else 1) + 1) ** -0.5
+                    kv_ok = hip_kv_conv_1w(
+                        k, v, k_weight, v_weight, k_dynamic, v_dynamic,
+                        conv_state.kv_cache, key_cache, value_cache, md.slot_mapping,
+                        positions, conv_md.seq_idx, conv_md.slot_mapping,
+                        conv_md.block_table, conv_md.query_start,
+                        num_tokens=num_tokens, num_heads=self.num_kv_heads,
+                        head_dim=self.head_dim, width=width, scale=scale,
+                        clip_threshold=self.qk_clip, clip_eps=1e-6, norm_eps=self.eps,
+                    )
+                    if kv_ok and hip_flash_rel_attn_prefill(
+                        clipped_q, r_clipped, rel_proj_t,
+                        key_cache, value_cache, gate, sinks, output,
+                        block_table=md.block_table,
+                        cache_seqlens=md.seq_lens,
+                        cu_seqlens_q=md.query_start_loc,
+                        max_seqlen_q=md.max_query_len,
+                        num_actual_tokens=md.num_actual_tokens,
+                        softmax_scale=self.scaling,
+                        window=self.window,
+                    ):
+                        return
+
+        # Zero-materialization 1M-ready native HIP decode attention (SP2 Unit D1).
+        if rel_proj_t is not None and num_splits > 0 and 1 <= num_tokens <= 64:
+            from .ops.hip_runtime import (
+                can_run_hip_decode_attn,
+                can_run_hip_kv_conv_decode,
+                hip_decode_combine,
+                hip_flash_rel_decode_split,
+                hip_kv_conv_decode,
+                hip_qr_clip,
+            )
+
+            dynamic = k_dynamic is not None
+            k_weight = self.k_sconv.conv_weight
+            v_weight = self.v_sconv.conv_weight
+            width = k_weight.shape[0] if dynamic else k_weight.shape[1]
+            kv_writer_ok = can_run_hip_kv_conv_decode(
+                k, v, k_weight, v_weight, k_dynamic, v_dynamic,
+                conv_state.kv_cache, key_cache, value_cache, md.slot_mapping,
+                num_tokens=num_tokens, head_dim=self.head_dim, width=width,
+            )
+            if can_run_hip_decode_attn(
+                q, r_view, key_cache, value_cache,
+                max_query_len=md.max_query_len,
+                num_splits=num_splits,
+                kv_writer_ok=kv_writer_ok,
+                rel_proj_t=rel_proj_t,
+                q_scale=self.q_scale,
+                r_scale=self.r_scale,
+                gate=gate,
+                sinks=sinks,
+                output=output,
+                q_out=clipped_q,
+            ):
+                qr_res = hip_qr_clip(
+                    q, r_view, self.q_scale, self.r_scale, tau,
+                    q_threshold=self.qk_clip, r_threshold=self.rel_clip,
+                    eps=1e-6, q_out=clipped_q, unit="decode_attn",
+                )
+                if qr_res is not None:
+                    _, r_clipped = qr_res
+                    scale = (width * (2 if dynamic else 1) + 1) ** -0.5
+                    kv_ok = hip_kv_conv_decode(
+                        k, v, k_weight, v_weight, k_dynamic, v_dynamic,
+                        conv_state.kv_cache, key_cache, value_cache, md.slot_mapping,
+                        positions, conv_md.seq_idx, conv_md.slot_mapping,
+                        conv_md.block_table, conv_md.query_start, md.query_start_loc,
+                        num_tokens=num_tokens, num_heads=self.num_kv_heads,
+                        head_dim=self.head_dim, width=width, scale=scale,
+                        clip_threshold=self.qk_clip, clip_eps=1e-6, norm_eps=self.eps,
+                    )
+                    if kv_ok:
+                        dec_res = hip_flash_rel_decode_split(
+                            clipped_q, r_clipped, rel_proj_t, key_cache, value_cache,
+                            block_table=md.block_table,
+                            cache_seqlens=md.seq_lens,
+                            cu_seqlens_q=md.query_start_loc,
+                            max_query_len=md.max_query_len,
+                            softmax_scale=self.scaling,
+                            is_local=self.is_local,
+                            has_rel=True,
+                            window=self.window,
+                            extent=self.rel_extent,
+                        )
+                        if dec_res is not None and hip_decode_combine(
+                            dec_res[0], dec_res[1], gate, sinks, output,
+                            cu_seqlens_q=md.query_start_loc,
+                            num_splits=dec_res[2],
+                            has_gate=True,
+                        ):
+                            return
+
         # Sheared as `rel_attention` reads it (see attention_prologue).
         if self._turbo_prefill_attn and num_tokens >= 16:
             from .ops.turbo_kernels import turbo_attention_prologue
@@ -690,7 +844,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             ).transpose(0, 1)
             turbo_attention_prologue(
                 q,
-                r.view(num_tokens, self.num_heads, self.d_rel),
+                r_view,
                 k,
                 v,
                 self.q_scale,
@@ -724,7 +878,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             )
             attention_prologue(
                 q,
-                r.view(num_tokens, self.num_heads, self.d_rel),
+                r_view,
                 k,
                 v,
                 self.q_scale,
@@ -752,20 +906,6 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 rel_threshold=self.rel_clip,
                 norm_eps=self.eps,
             )
-        # Decode and verify batches split the keys; the split count follows
-        # the batch alone, so it holds for every replay of a CUDA graph.
-        m1 = md.seq_lens.shape[0] == md.max_query_len == 1
-        key_tile = self.m1_key_tile if m1 else None
-        num_splits = plan_decode_attention(
-            self.is_local,
-            md.seq_lens.shape[0],
-            md.max_query_len,
-            self.num_heads,
-            self.num_kv_heads,
-            self.rel_extent,
-            programs_per_cu=self.m1_split_programs_per_cu if m1 else None,
-            key_tile=key_tile,
-        )
         if num_splits:
             if (
                 self._turbo_prefill_attn

@@ -42,6 +42,11 @@ def _controller_gain_forget_kernel(Hidden, Weight, Out, BLOCK_ROWS: tl.constexpr
 
 
 def _project_down(pair: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    from .hip_runtime import hip_loop_decode_down
+
+    hip_out = hip_loop_decode_down(pair, weight)
+    if hip_out is not None:
+        return hip_out
     streams = pair.shape[0]
     hidden = pair.new_empty((streams, 1, _RANK))
     _controller_down_kernel[(_RANK, streams)](pair, weight, hidden, num_warps=4)

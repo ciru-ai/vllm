@@ -49,6 +49,11 @@ def mix_rmsnorm(
     rows, taps, hidden = targets.shape
     assert alpha.shape == (taps,) and alpha.is_contiguous()
     assert weight.shape == (hidden,) and weight.is_contiguous()
+    from .hip_runtime import hip_mix_rmsnorm
+
+    hip_out = hip_mix_rmsnorm(targets, alpha, weight, eps)
+    if hip_out is not None:
+        return hip_out
     out = targets.new_empty((rows, hidden))
     if rows:
         _mix_rmsnorm_kernel[(rows,)](
@@ -129,6 +134,13 @@ def qk_norm_rope_(
     leading `num_q_heads + num_k_heads` heads of the fused `qkv`."""
     head_dim = cos_sin_cache.shape[-1]
     if qkv.shape[0]:
+        from .hip_runtime import hip_qk_norm_rope_
+
+        if hip_qk_norm_rope_(
+            qkv, positions, q_weight, k_weight, cos_sin_cache,
+            num_q_heads, num_k_heads, head_dim, eps, norm=True,
+        ):
+            return
         _qk_norm_rope_kernel[(qkv.shape[0], num_q_heads + num_k_heads)](
             qkv,
             q_weight,
@@ -149,6 +161,13 @@ def rope_(x: torch.Tensor, positions: torch.Tensor, cos_sin_cache: torch.Tensor)
     num_tokens, num_heads, head_dim = x.shape
     assert x.stride(1) == head_dim and x.stride(2) == 1
     if num_tokens:
+        from .hip_runtime import hip_qk_norm_rope_
+
+        if hip_qk_norm_rope_(
+            x.view(num_tokens, num_heads * head_dim), positions, None, None,
+            cos_sin_cache, 0, num_heads, head_dim, 0.0, norm=False,
+        ):
+            return
         _qk_norm_rope_kernel[(num_tokens, num_heads)](
             x,
             x,
@@ -179,6 +198,11 @@ def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
     """`silu(gate) * up` in fp32 (precise exp/div), rounded once."""
     num_tokens, width = x.shape
     n = width // 2
+    from .hip_runtime import hip_silu_and_mul
+
+    hip_out = hip_silu_and_mul(x)
+    if hip_out is not None:
+        return hip_out
     out = x.new_empty((num_tokens, n))
     if num_tokens:
         _silu_and_mul_kernel[(num_tokens, triton.cdiv(n, 1024))](
@@ -205,6 +229,11 @@ def add_softcap(a: torch.Tensor, b: torch.Tensor, softcap: float) -> torch.Tenso
     """bf16 `softcap * tanh(bf16(a + b) / softcap)` of two bf16 2D tensors."""
     rows, n = a.shape
     assert a.stride(1) == 1 and b.stride(1) == 1
+    from .hip_runtime import hip_add_softcap
+
+    hip_out = hip_add_softcap(a, b, softcap)
+    if hip_out is not None:
+        return hip_out
     out = a.new_empty((rows, n))
     if rows:
         _add_softcap_kernel[(triton.cdiv(n, 1024), rows)](
@@ -250,6 +279,11 @@ def markov_gate(
     rows, rank = state.shape
     assert raw.shape == (rows, 3 * rank) and raw.is_contiguous()
     assert state.is_contiguous() and rank & (rank - 1) == 0
+    from .hip_runtime import hip_markov_gate
+
+    hip_res = hip_markov_gate(raw, state)
+    if hip_res is not None:
+        return hip_res
     out, latent = torch.empty_like(state), torch.empty_like(state)
     if rows:
         _markov_gate_kernel[(rows,)](raw, state, out, latent, rank)

@@ -92,6 +92,11 @@ def route_m8(logits, bias, scale, mode):
     ):
         raise ValueError("Expected contiguous ROCm FP32 M8-128 logits and 128 biases")
 
+    from .hip_runtime import hip_route_m8
+
+    hip_res = hip_route_m8(logits, bias, scale, mode)
+    if hip_res is not None:
+        return hip_res
     align = mode != "tail"
     sigmoid = mode != "select"
     ids = torch.empty((8, 8), dtype=torch.int64, device=logits.device)

@@ -340,6 +340,15 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
                 hidden = controller_down_m8(pair, down_weight)
             else:
                 hidden = torch.bmm(pair, down_weight.transpose(1, 2))
+            if self.use_packed_loop and 1 <= pair.shape[1] <= 64:
+                from .ops.hip_runtime import hip_loop_decode_blend_rms
+
+                result = hip_loop_decode_blend_rms(
+                    hidden, self.controller_gain_forget[streams],
+                    dest, message, norm_weight, norm_eps,
+                )
+                if result is not None:
+                    return result
             if self.loop_m8_fused and self.use_packed_loop and pair.shape[1] == 8:
                 from .ops.loop_m8_fused import fused_loop_m8_blend
 

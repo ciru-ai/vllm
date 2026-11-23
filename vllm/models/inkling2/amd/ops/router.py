@@ -55,6 +55,11 @@ def router_scores_m1(
         or weight.data_ptr() % 4
     ):
         return None
+    from .hip_runtime import hip_router_gemm_m8
+
+    hip_out = hip_router_gemm_m8(x, weight, bias)
+    if hip_out is not None:
+        return hip_out
     score = x.new_empty((1, 128), dtype=torch.float32)
     corrected = torch.empty_like(score)
     _router_scores_m1_kernel[(128,)](
@@ -113,6 +118,11 @@ def select_top8_routes_m1(
     ):
         raise ValueError("expected contiguous M1 FP32 raw and corrected scores")
 
+    from .hip_runtime import hip_route_m8
+
+    hip_res = hip_route_m8(score, corrected.squeeze(0), scale, "tail", already_sigmoid=True, bias_is_corrected=True)
+    if hip_res is not None:
+        return hip_res[0], hip_res[1]
     ids = score.new_empty((1, 8), dtype=torch.int64)
     gamma = score.new_empty((1, 8))
     _select_top8_routes_kernel[(1,)](

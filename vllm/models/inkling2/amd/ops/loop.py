@@ -113,6 +113,11 @@ def pair_rms_norm(
     dest: torch.Tensor, message: torch.Tensor, *, packed: bool = False
 ) -> torch.Tensor:
     if packed and _packed_rows(dest, message):
+        from .hip_runtime import hip_pair_rmsnorm
+
+        hip_out = hip_pair_rmsnorm(dest, message)
+        if hip_out is not None:
+            return hip_out
         streams, tokens, width = message.shape
         out = message.new_empty((streams, tokens, 2 * width), dtype=torch.bfloat16)
         if tokens:
@@ -147,6 +152,11 @@ def blend_rms_norm(
             and norm_weight.stride(-1) == 1
             and norm_weight.device == dest.device
         ):
+            from .hip_runtime import hip_blend_rmsnorm
+
+            hip_out = hip_blend_rmsnorm(dest, message, gain_forget, norm_weight, norm_eps)
+            if hip_out is not None:
+                return hip_out
             out = message.new_empty(message.shape, dtype=torch.bfloat16)
             if tokens:
                 _blend_rms_norm_kernel[(tokens, streams)](

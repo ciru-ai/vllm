@@ -93,6 +93,11 @@ def fused_loop_m8_blend(
     ):
         return None
 
+    from .hip_runtime import hip_loop_decode_blend_rms
+
+    hip_out = hip_loop_decode_blend_rms(hidden, weight, dest, message, norm_weight, norm_eps)
+    if hip_out is not None:
+        return hip_out
     blended = dest.new_empty(dest.shape)
     out = dest.new_empty(dest.shape, dtype=torch.bfloat16)
     _controller_m8_blend_kernel[(width // 8, streams)](

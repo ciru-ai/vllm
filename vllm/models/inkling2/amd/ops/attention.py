@@ -396,6 +396,16 @@ def block_decode_attention(
     """
     num_tokens, num_heads, head_dim = q.shape
     assert out.is_contiguous()
+    if 1 <= num_tokens <= 64 and 1 <= block <= 8 and num_splits > 0:
+        from .hip_runtime import hip_block_decode_attention
+
+        if hip_block_decode_attention(
+            q, key_cache, value_cache, out,
+            block_table=block_table, cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q, block=block, window=window,
+            num_splits=num_splits,
+        ):
+            return
     single = num_splits == 1
     out_3d = out.view(num_tokens, num_heads, head_dim)
     o_part, lse_part = _launch(

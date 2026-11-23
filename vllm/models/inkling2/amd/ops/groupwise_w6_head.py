@@ -310,6 +310,13 @@ def groupwise_w6_head_linear(
             result = (result / soft_cap).tanh() * soft_cap
         return result.to(out_dtype)
 
+    if n:
+        from .hip_runtime import hip_w6_head_gemv_m1
+        hip_out = hip_w6_head_gemv_m1(
+            x, pair, third, scales, out_dtype=out_dtype, soft_cap=soft_cap,
+        )
+        if hip_out is not None:
+            return hip_out
     result = x.new_empty((1, n), dtype=out_dtype)
     if n:
         _groupwise_w6_head_gemv[(triton.cdiv(n, num_warps),)](
